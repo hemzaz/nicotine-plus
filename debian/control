@@ -1,0 +1,41 @@
+Source: nicotine
+Section: net
+Priority: extra
+Maintainer: Kip Warner <kip@thevertigo.com>
+Standards-Version: 4.1.1
+Build-Depends:
+    debhelper (>= 10),
+    dh-python,
+    python-all,
+    python-gobject-2,
+    gettext,
+    lintian,
+    python-setuptools,
+    quilt
+Vcs-Git: https://github.com/Nicotine-Plus/nicotine-plus.git
+Vcs-browser: https://github.com/Nicotine-Plus/nicotine-plus
+X-Python-Version: >= 2.7
+Homepage: https://www.nicotine-plus.org/
+
+Package: nicotine
+Architecture: all
+Depends:
+    ${python:Depends},
+    ${misc:Depends},
+    miniupnpc (>= 1.9),
+    python-gobject-2,
+    python-gtk2 (>= 2.24),
+    python (>= 2.7),
+    python-mutagen (>= 1.25),
+    xdg-utils
+Recommends: python-geoip, python-notify
+Suggests: python-gnome2, python-sexy, python-dbus, python-gst0.10
+Description: graphical client for SoulSeek P2P network (Gtk+ / Python 2)
+ Nicotine+ is a client for SoulSeek, a light and efficient file sharing
+ system, written in Python and using the GTK+2 toolkit, based on the
+ PySoulSeek project.
+ .
+ It features uploading, downloading, searching and chatting, with
+ strict bandwidth control, and tries to look like PySoulSeek.
+ .
+ This package installs the Gtk+ 2 client which uses Python 2.

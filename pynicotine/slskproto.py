@@ -38,7 +38,7 @@ import threading
 import struct
 
 from errno import EINTR
-from utils import _, win32
+from utils import win32
 from logfacility import log
 
 MAXFILELIMIT = -1
@@ -259,8 +259,8 @@ class SlskProtoThread(threading.Thread):
 	# - With Windows, based on #473, it would seem these connections are never removed
 	CONNECTION_MAX_IDLE = 60
 
-	def __init__(self, ui_callback, queue, bindip, config, eventprocessor):
-		""" ui_callback is a UI callback function to be called with messages 
+	def __init__(self, ui_callback, queue, bindip, port, config, eventprocessor):
+		""" ui_callback is a UI callback function to be called with messages
 		list as a parameter. queue is Queue object that holds messages from UI
 		thread.
 		"""
@@ -272,7 +272,7 @@ class SlskProtoThread(threading.Thread):
 		self._bindip = bindip
 		self._config = config
 		self._eventprocessor = eventprocessor
-		portrange = config.sections["server"]["portrange"]
+		portrange = (port, port) if port else config.sections["server"]["portrange"]
 		self.serverclasses = {}
 		for i in self.servercodes.keys():
 			self.serverclasses[self.servercodes[i]] = i
@@ -294,9 +294,9 @@ class SlskProtoThread(threading.Thread):
 		listenport = None
 		self.lastsocketwarning = 0
 
-		for listenport in range(portrange[0], portrange[1]+1):
+		for listenport in range(int(portrange[0]), int(portrange[1])+1):
 			try:
-				self._p.bind(('', listenport))
+				self._p.bind((bindip or '', listenport))
 			except socket.error:
 				listenport = None
 			else:
@@ -425,6 +425,8 @@ class SlskProtoThread(threading.Thread):
 			except ValueError, error:
 				# Possibly opened too many sockets
 				print time.strftime("%H:%M:%S"), "select ValueError:",  error
+				if not self.killOverflowConnection(connsinprogress):
+					self.killOverflowConnection(conns)
 				continue
 			# Write Output
 			for (key, value) in conns.iteritems():
@@ -442,7 +444,10 @@ class SlskProtoThread(threading.Thread):
 				else:
 					ip, port = self.getIpPort(incaddr)
 					if self.ipBlocked(ip):
-						message = _("Ignoring connection request from blocked IP Address %s:%s" %( ip, port))
+						message = _("Ignoring connection request from blocked IP Address %(ip)s:%(port)s" % {
+							'ip': ip,
+							'port': port
+						})
 						log.add(message, 3)
 					else:
 						conns[incconn] = PeerConnection(incconn, incaddr, "", "")
@@ -551,7 +556,35 @@ class SlskProtoThread(threading.Thread):
 			server_socket.close()
 		#print "Networking thread aborted"
 		self._stopped = 1
-		
+
+	# randomly selects a safe connection to kill and closes the socket--
+	# Will not kill upload, download, or server connections
+	def killOverflowConnection(self, conns):
+		victim_conn = None
+		for (k, v) in conns.iteritems():
+			if self._isUpload(v):
+				continue
+			if self._isDownload(v):
+				continue
+			if k is self._server_socket:
+				continue
+			victim_conn = k
+			break
+
+		if victim_conn is None:
+			return False
+
+		del conns[victim_conn]
+		# if endpoint is not connected, will get an exception on sockets...
+		try:
+			pn = victim_conn.getpeername()
+			print 'Killing overflow connection ', pn
+			victim_conn.shutdown(socket.SHUT_RDWR)
+			victim_conn.close()
+		except:
+			return False
+		return True
+
 	def socketStillActive(self, conn):
 		try:
 			connection = self._conns[conn]
@@ -723,7 +756,7 @@ class SlskProtoThread(threading.Thread):
 						pass
 					conn.fileupl.offset = offset
 					self._ui_callback([conn.fileupl])
-		    
+
 		conn.ibuf = msgBuffer
 		return msgs, conn
 
