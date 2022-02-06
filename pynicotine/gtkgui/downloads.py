@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-#
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
 # COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
 # COPYRIGHT (C) 2016-2018 Mutnick <mutnick@techie.com>
 # COPYRIGHT (C) 2013 eL_vErDe <gandalf@le-vert.net>
@@ -24,497 +23,160 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import gtk
-from thread import start_new_thread
-
-from transferlist import TransferList
-from utils import PopupMenu, PressHeader, HumanSize
-from pynicotine import slskmessages
-import string
 import os
-from pynicotine.utils import executeCommand
-from entrydialog import MetaDialog, OptionDialog
+
+from pynicotine.config import config
+from pynicotine.gtkgui.transferlist import TransferList
+from pynicotine.gtkgui.utils import copy_text
+from pynicotine.gtkgui.widgets.dialogs import option_dialog
+from pynicotine.utils import open_file_path
 
 
 class Downloads(TransferList):
 
     def __init__(self, frame):
 
-        TransferList.__init__(self, frame, frame.DownloadList, type='downloads')
-        self.myvbox = self.frame.downloadsvbox
-        self.frame.DownloadList.set_property("rules-hint", True)
-        self.accel_group = gtk.AccelGroup()
+        self.path_separator = '/'
+        self.path_label = _("Path")
+        self.retry_label = _("_Resume")
+        self.abort_label = _("P_ause")
+        self.aborted_status = "Paused"
 
-        self.popup_menu2 = popup2 = PopupMenu(frame)
-        popup2.setup(
-            ("#" + _("Clear finished/aborted"), self.OnClearFinishedAborted),
-            ("#" + _("Clear finished"), self.OnClearFinished),
-            ("#" + _("Clear aborted"), self.OnClearAborted),
-            ("#" + _("Clear paused"), self.OnClearPaused),
-            ("#" + _("Clear filtered"), self.OnClearFiltered),
-            ("#" + _("Clear queued"), self.OnClearQueued)
+        TransferList.__init__(self, frame, transfer_type="download")
+
+        self.popup_menu_clear.add_items(
+            ("#" + _("Finished / Filtered"), self.on_clear_finished_filtered),
+            ("", None),
+            ("#" + _("Finished"), self.on_clear_finished),
+            ("#" + _("Paused"), self.on_clear_paused),
+            ("#" + _("Failed"), self.on_clear_failed),
+            ("#" + _("Filtered"), self.on_clear_filtered),
+            ("#" + _("Queued…"), self.on_try_clear_queued),
+            ("", None),
+            ("#" + _("Clear All…"), self.on_try_clear_all),
         )
-        self.popup_menu_users = PopupMenu(frame)
+        self.popup_menu_clear.update_model()
 
-        self.popup_menu = popup = PopupMenu(frame)
-        popup.setup(
-            ("#" + _("Get place in _queue"), self.OnGetPlaceInQueue),
-            ("", None),
-            ("#" + _("Copy _URL"), self.OnCopyURL),
-            ("#" + _("Copy folder URL"), self.OnCopyDirURL),
-            ("#" + _("Send to _player"), self.OnPlayFiles),
-            ("#" + _("View Metadata of file(s)"), self.OnDownloadMeta),
-            ("#" + _("Open Directory"), self.OnOpenDirectory),
-            ("#" + _("Search"), self.OnFileSearch),
-            (1, _("User(s)"), self.popup_menu_users, self.OnPopupMenuUsers),
-            ("", None),
-            ("#" + _("_Retry"), self.OnRetryTransfer),
-            ("", None),
-            ("#" + _("Abor_t"), self.OnAbortTransfer),
-            ("#" + _("Abort & Delete"), self.OnAbortRemoveTransfer),
-            ("#" + _("_Clear"), self.OnClearTransfer),
-            ("", None),
-            (1, _("Clear Groups"), self.popup_menu2, None)
+    def switch_tab(self):
+        self.frame.change_main_page("downloads")
+
+    def on_try_clear_queued(self, *_args):
+
+        option_dialog(
+            parent=self.frame.MainWindow,
+            title=_('Clear Queued Downloads'),
+            message=_('Do you really want to clear all queued downloads?'),
+            callback=self.on_clear_response,
+            callback_data="queued"
         )
 
-        frame.DownloadList.connect("button_press_event", self.OnPopupMenu, "mouse")
-        frame.DownloadList.connect("key-press-event", self.on_key_press_event)
-        cols = frame.DownloadList.get_columns()
+    def on_try_clear_all(self, *_args):
 
-        for i in range(9):
+        option_dialog(
+            parent=self.frame.MainWindow,
+            title=_('Clear All Downloads'),
+            message=_('Do you really want to clear all downloads?'),
+            callback=self.on_clear_response,
+            callback_data="all"
+        )
 
-            parent = cols[i].get_widget().get_ancestor(gtk.Button)
-            if parent:
-                parent.connect("button_press_event", PressHeader)
+    def folder_download_response(self, dialog, response_id, msg):
 
-            # Read Show / Hide column settings from last session
-            cols[i].set_visible(self.frame.np.config.sections["columns"]["downloads_columns"][i])
+        dialog.destroy()
 
-        frame.clearFinishedAbortedButton.connect("clicked", self.OnClearFinishedAborted)
-        frame.clearQueuedButton.connect("clicked", self.OnTryClearQueued)
-        frame.retryTransferButton.connect("clicked", self.OnRetryTransfer)
-        frame.abortTransferButton.connect("clicked", self.OnSelectAbortTransfer)
-        frame.deleteTransferButton.connect("clicked", self.OnAbortRemoveTransfer)
-        frame.banDownloadButton.connect("clicked", self.OnBan)
-        frame.DownloadList.expand_all()
+        if response_id == 2:
+            self.frame.np.transfers.folder_contents_response(msg)
 
-        self.frame.ToggleAutoRetry.set_active(self.frame.np.config.sections["transfers"]["autoretry_downloads"])
-        frame.ToggleAutoRetry.connect("toggled", self.OnToggleAutoRetry)
+    def download_large_folder(self, username, folder, numfiles, msg):
 
-        self.frame.ToggleTreeDownloads.set_active(self.frame.np.config.sections["transfers"]["groupdownloads"])
-        frame.ToggleTreeDownloads.connect("toggled", self.OnToggleTree)
-        self.OnToggleTree(None)
+        option_dialog(
+            parent=self.frame.MainWindow,
+            title=_("Download %(num)i files?") % {'num': numfiles},
+            message=_("Do you really want to download %(num)i files from %(user)s's folder %(folder)s?") % {
+                'num': numfiles, 'user': username, 'folder': folder},
+            callback=self.folder_download_response,
+            callback_data=msg
+        )
 
-        self.frame.ExpandDownloads.set_active(self.frame.np.config.sections["transfers"]["downloadsexpanded"])
-        frame.ExpandDownloads.connect("toggled", self.OnExpandDownloads)
-        self.OnExpandDownloads(None)
+    def on_copy_url(self, *_args):
 
-    def saveColumns(self):
-        columns = []
-        widths = []
-        for column in self.frame.DownloadList.get_columns():
-            columns.append(column.get_visible())
-            widths.append(column.get_width())
-        self.frame.np.config.sections["columns"]["downloads_columns"] = columns
-        self.frame.np.config.sections["columns"]["downloads_widths"] = widths 
-    def OnToggleAutoRetry(self, widget):
-        self.frame.np.config.sections["transfers"]["autoretry_downloads"] = self.frame.ToggleAutoRetry.get_active()
+        transfer = next(iter(self.selected_transfers), None)
 
-    def OnTryClearQueued(self, widget):
+        if transfer:
+            url = self.frame.np.userbrowse.get_soulseek_url(transfer.user, transfer.filename)
+            copy_text(url)
 
-        direction = "down"
-        win = OptionDialog(self.frame, _("Clear All Queued Downloads?"), modal=True, status=None, option=False, third="")
-        win.connect("response", self.frame.on_clear_response, direction)
-        win.set_title(_("Nicotine+") + ": " + _("Clear Queued Transfers"))
-        win.set_icon(self.frame.images["n"])
-        win.show()
+    def on_copy_dir_url(self, *_args):
 
-    def expandcollapse(self, path):
+        transfer = next(iter(self.selected_transfers), None)
 
-        if self.frame.ExpandDownloads.get_active():
-            self.frame.DownloadList.expand_row(path, True)
+        if transfer:
+            url = self.frame.np.userbrowse.get_soulseek_url(
+                transfer.user, transfer.filename.rsplit('\\', 1)[0] + '\\')
+            copy_text(url)
+
+    def on_open_file_manager(self, *_args):
+
+        downloaddir = config.sections["transfers"]["downloaddir"]
+        incompletedir = config.sections["transfers"]["incompletedir"] or downloaddir
+
+        for transfer in self.selected_transfers:
+            if transfer.status == "Finished":
+                final_path = transfer.path if os.path.exists(transfer.path) else downloaddir
+                break
         else:
-            self.frame.DownloadList.collapse_row(path)
+            final_path = incompletedir
 
-    def OnExpandDownloads(self, widget):
+        # Finally, try to open the directory we got...
+        command = config.sections["ui"]["filemanager"]
+        open_file_path(final_path, command)
 
-        expanded = self.frame.ExpandDownloads.get_active()
+    def on_play_files(self, *_args):
 
-        if expanded:
-            self.frame.DownloadList.expand_all()
-            self.frame.ExpandDownloadsImage.set_from_stock(gtk.STOCK_REMOVE, 4)
-        else:
-            self.frame.DownloadList.collapse_all()
-            self.frame.ExpandDownloadsImage.set_from_stock(gtk.STOCK_ADD, 4)
+        for transfer in self.selected_transfers:
 
-        self.frame.np.config.sections["transfers"]["downloadsexpanded"] = expanded
-        self.frame.np.config.writeConfiguration()
-
-    def OnToggleTree(self, widget):
-
-        self.TreeUsers = self.frame.ToggleTreeDownloads.get_active()
-        self.frame.np.config.sections["transfers"]["groupdownloads"] = self.TreeUsers
-
-        if not self.TreeUsers:
-            self.frame.ExpandDownloads.hide()
-        else:
-            self.frame.ExpandDownloads.show()
-
-        self.RebuildTransfers()
-
-    def MetaBox(self, title="Meta Data", message="", data=None, modal=True, Search=False):
-
-        win = MetaDialog(self.frame, message,  data, modal, Search=Search)
-        win.set_title(title)
-        win.set_icon(self.frame.images["n"])
-        win.show()
-        gtk.main()
-
-        return win.ret
-
-    def SelectedResultsAllData(self, model, path, iter, data):
-        if iter in self.selected_users:
-            return
-
-        user = model.get_value(iter, 0)
-        filename = model.get_value(iter, 1)
-        fullname = model.get_value(iter, 10)
-        size = speed = "0"
-        length = bitrate = None
-        queue = immediate = num = country = bitratestr = ""
-
-        for transfer in self.frame.np.transfers.downloads:
-            if transfer.user == user and fullname == transfer.filename:
-                size = HumanSize(transfer.size)
-                try:
-                    speed = str(int(transfer.speed))
-                    speed += _(" KB/s")
-                except:
-                    pass
-                bitratestr = str(transfer.bitrate)
-                length = str(transfer.length)
-
-        directory = fullname.rsplit("\\", 1)[0]
-
-        data[len(data)] = {
-            "user": user,
-            "fn": fullname,
-            "position": num,
-            "filename": filename,
-            "directory": directory,
-            "size": size,
-            "speed": speed,
-            "queue": queue,
-            "immediate": immediate,
-            "bitrate": bitratestr,
-            "length": length,
-            "country": country
-        }
-
-    def OnDownloadMeta(self, widget):
-
-        if not self.frame.np.transfers:
-            return
-
-        data = {}
-        self.widget.get_selection().selected_foreach(self.SelectedResultsAllData, data)
-
-        if data != {}:
-            self.MetaBox(title=_("Nicotine+:") + " " + _("Downloads Metadata"), message=_("<b>Metadata</b> for Downloads"), data=data, modal=True, Search=False)
-
-    def OnOpenDirectory(self, widget):
-
-        downloaddir = self.frame.np.config.sections["transfers"]["downloaddir"]
-        incompletedir = self.frame.np.config.sections["transfers"]["incompletedir"]
-
-        if incompletedir == "":
-            incompletedir = downloaddir
-
-        filemanager = self.frame.np.config.sections["ui"]["filemanager"]
-        transfer = self.selected_transfers[0]
-
-        complete_path = os.path.join(downloaddir, transfer.path)
-
-        if transfer.path is "":
-            if transfer.status is "Finished":
-                executeCommand(filemanager, downloaddir)
-            else:
-                executeCommand(filemanager, incompletedir)
-        elif os.path.exists(complete_path):  # and tranfer.status is "Finished"
-            executeCommand(filemanager, complete_path)
-        else:
-            executeCommand(filemanager, incompletedir)
-
-    def RebuildTransfers(self):
-
-        if self.frame.np.transfers is None:
-            return
-
-        self.Clear()
-        self.update()
-
-    def select_transfers(self):
-        self.selected_transfers = []
-        self.selected_users = []
-        self.widget.get_selection().selected_foreach(self.SelectedTransfersCallback)
-
-    def OnBan(self, widgets):
-        self.select_transfers()
-        for user in self.selected_users:
-            self.frame.BanUser(user)
-
-    def OnSelectAbortTransfer(self, widget):
-        self.select_transfers()
-        self.OnAbortTransfer(widget, False)
-
-    def OnSelectUserTransfer(self, widget):
-
-        if len(self.selected_users) == 0:
-            return
-
-        selected_user = widget.parent.user
-
-        sel = self.frame.DownloadList.get_selection()
-        fmodel = self.frame.DownloadList.get_model()
-        sel.unselect_all()
-
-        for item in self.transfers:
-            user_file, iter, transfer = item
-            user, filepath = user_file
-            if selected_user == user:
-                ix = fmodel.get_path(iter)
-                sel.select_path(ix,)
-
-        self.select_transfers()
-
-    def on_key_press_event(self, widget, event):
-
-        key = gtk.gdk.keyval_name(event.keyval)
-
-        if key in ("P", "p"):
-            self.OnPopupMenu(widget, event, "keyboard")
-        else:
-            self.select_transfers()
-
-            if key in ("T", "t"):
-                self.OnAbortTransfer(widget)
-            elif key in ("R", "r"):
-                self.OnRetryTransfer(widget)
-            elif key == "Delete":
-                self.OnAbortTransfer(widget, True, True)
-
-    def OnPlayFiles(self, widget, prefix=""):
-        start_new_thread(self._OnPlayFiles, (widget, prefix))
-
-    def _OnPlayFiles(self, widget, prefix=""):
-
-        executable = self.frame.np.config.sections["players"]["default"]
-        downloaddir = self.frame.np.config.sections["transfers"]["downloaddir"]
-
-        if "$" not in executable:
-            return
-
-        for fn in self.selected_transfers:
-
-            if fn.file is None:
-                continue
             playfile = None
 
-            if os.path.exists(fn.file.name):
-                playfile = fn.file.name
+            if transfer.file is not None and os.path.exists(transfer.file.name):
+                playfile = transfer.file.name
+
             else:
-                # If this file doesn't exist anymore, it may have finished downloading and have been renamed
-                # try looking in the download directory and match the original filename.
-                basename = string.split(fn.filename, '\\')[-1]
-                path = os.sep.join([downloaddir, basename])
-                if os.path.exists(path):
-                    playfile = path
+                # If this file doesn't exist anymore, it may have finished downloading and have been renamed.
+                # Try looking in the download directory and match the original filename and size.
+
+                download_path = self.frame.np.transfers.get_existing_download_path(
+                    transfer.user, transfer.filename, transfer.path, transfer.size)
+
+                if download_path:
+                    playfile = download_path
 
             if playfile:
-                executeCommand(executable, playfile, background=False)
+                command = config.sections["players"]["default"]
+                open_file_path(playfile, command)
 
-    def OnPopupMenuUsers(self, widget):
+    def on_browse_folder(self, *_args):
 
-        self.selected_transfers = []
-        self.selected_users = []
-        self.widget.get_selection().selected_foreach(self.SelectedTransfersCallback)
-
-        self.popup_menu_users.clear()
-
-        if len(self.selected_users) > 0:
-
-            items = []
-            self.selected_users.sort(key=str.lower)
-
-            for user in self.selected_users:
-
-                popup = PopupMenu(self.frame)
-                popup.setup(
-                    ("#" + _("Send _message"), popup.OnSendMessage),
-                    ("#" + _("Show IP a_ddress"), popup.OnShowIPaddress),
-                    ("#" + _("Get user i_nfo"), popup.OnGetUserInfo),
-                    ("#" + _("Brow_se files"), popup.OnBrowseUser),
-                    ("#" + _("Gi_ve privileges"), popup.OnGivePrivileges),
-                    ("", None),
-                    ("$" + _("_Add user to list"), popup.OnAddToList),
-                    ("$" + _("_Ban this user"), popup.OnBanUser),
-                    ("$" + _("_Ignore this user"), popup.OnIgnoreUser),
-                    ("#" + _("Select User's Transfers"), self.OnSelectUserTransfer)
-                )
-                popup.set_user(user)
-
-                items.append((1, user, popup, self.OnPopupMenuUser, popup))
-
-            self.popup_menu_users.setup(*items)
-
-        return True
-
-    def OnPopupMenuUser(self, widget, popup=None):
-
-        if popup is None:
-            return
-
-        menu = popup
-        user = menu.user
-        items = menu.get_children()
-
-        act = False
-        if len(self.selected_users) >= 1:
-            act = True
-
-        items[0].set_sensitive(act)
-        items[1].set_sensitive(act)
-        items[2].set_sensitive(act)
-        items[3].set_sensitive(act)
-
-        items[6].set_active(user in [i[0] for i in self.frame.np.config.sections["server"]["userlist"]])
-        items[7].set_active(user in self.frame.np.config.sections["server"]["banlist"])
-        items[8].set_active(user in self.frame.np.config.sections["server"]["ignorelist"])
-
-        for i in range(4, 9):
-            items[i].set_sensitive(act)
-
-        return True
-
-    def DoubleClick(self, event):
-
-        self.select_transfers()
-        dc = self.frame.np.config.sections["transfers"]["download_doubleclick"]
-
-        if dc == 1:  # Send to player
-            self.OnPlayFiles(None)
-        elif dc == 2:  # File manager
-            self.OnOpenDirectory(None)
-        elif dc == 3:  # Search
-            self.OnFileSearch(None)
-        elif dc == 4:  # Abort
-            self.OnAbortTransfer(None, False)
-        elif dc == 5:  # Clear
-            self.OnClearTransfer(None)
-        elif dc == 6:  # Retry
-            self.OnRetryTransfer(None)
-
-    def OnPopupMenu(self, widget, event, kind):
-
-        if kind == "mouse":
-            if event.button != 3:
-                if event.button == 1 and event.type == gtk.gdk._2BUTTON_PRESS:
-                    self.DoubleClick(event)
-                return False
-
-        self.selected_transfers = []
-        self.selected_users = []
-        self.widget.get_selection().selected_foreach(self.SelectedTransfersCallback)
-
-        users = len(self.selected_users) > 0
-        multi_users = len(self.selected_users) > 1
-        files = len(self.selected_transfers) > 0
-        multi_files = len(self.selected_transfers) > 1
-
-        self.SelectCurrentRow(event, kind)
-
-        items = self.popup_menu.get_children()
-        if users:
-            items[7].set_sensitive(True)  # Users Menu
-        else:
-            items[7].set_sensitive(False)  # Users Menu
-
-        if files:
-            act = True
-        else:
-            act = False
-
-        items[0].set_sensitive(act)  # Place
-        items[4].set_sensitive(act)  # Send to player
-        items[5].set_sensitive(act)  # View Meta
-        items[6].set_sensitive(act)  # File manager
-        items[8].set_sensitive(act)  # Search filename
-
-        act = False
-        if not multi_files and files:
-            act = True
-
-        items[2].set_sensitive(act)  # Copy URL
-        items[3].set_sensitive(act)  # Copy Folder URL
-
-        if not users or not files:
-            # Disable options
-            # Abort, Abort and Remove, retry, clear
-            act = False
-        else:
-            act = True
-
-        for i in range(10, 15):
-            items[i].set_sensitive(act)
-
-        self.popup_menu.popup(None, None, None, 3, event.time)
-
-        if kind == "keyboard":
-            widget.emit_stop_by_name("key_press_event")
-        elif kind == "mouse":
-            widget.emit_stop_by_name("button_press_event")
-
-        return True
-
-    def update(self, transfer=None, forced=False):
-
-        TransferList.update(self, transfer, forced)
-        if transfer is None and self.frame.np.transfers is not None:
-            self.frame.np.transfers.SaveDownloads()
-
-    def OnGetPlaceInQueue(self, widget):
-
-        self.select_transfers()
-
-        for i in self.selected_transfers:
-            if i.status != "Queued":
-                continue
-            self.frame.np.ProcessRequestToPeer(i.user, slskmessages.PlaceInQueueRequest(None, i.filename))
-
-    def OnFileSearch(self, widget):
-
-        self.select_transfers()
+        requested_users = set()
+        requested_folders = set()
 
         for transfer in self.selected_transfers:
-            self.frame.SearchEntry.set_text(transfer.filename.rsplit("\\", 1)[1])
-            self.frame.ChangeMainPage(None, "search")
-            break
+            user = transfer.user
+            folder = transfer.filename.rsplit('\\', 1)[0] + '\\'
 
-    def OnRetryTransfer(self, widget):
+            if user not in requested_users and folder not in requested_folders:
+                self.frame.np.userbrowse.browse_user(user, path=folder)
 
-        self.select_transfers()
+                requested_users.add(user)
+                requested_folders.add(folder)
 
-        for transfer in self.selected_transfers:
+    def on_clear_paused(self, *_args):
+        self.clear_transfers(["Paused"])
 
-            if transfer.status in ["Finished", "Old"]:
-                continue
+    def on_clear_finished_filtered(self, *_args):
+        self.clear_transfers(["Finished", "Filtered"])
 
-            self.frame.np.transfers.AbortTransfer(transfer)
-            transfer.req = None
-            self.frame.np.transfers.getFile(transfer.user, transfer.filename, transfer.path, transfer)
+    def on_clear_failed(self, *_args):
+        self.clear_transfers(["Cannot connect", "Local file error", "Remote file error", "File not shared"])
 
-        self.frame.np.transfers.SaveDownloads()
-
-    def OnAbortRemoveTransfer(self, widget):
-        self.select_transfers()
-        self.OnClearTransfer(widget)
+    def on_clear_filtered(self, *_args):
+        self.clear_transfers(["Filtered"])

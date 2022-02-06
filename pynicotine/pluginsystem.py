@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-#
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
 # COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
 # COPYRIGHT (C) 2016 Mutnick <muhing@yahoo.com>
 # COPYRIGHT (C) 2008-2011 Quinox <quinox@users.sf.net>
@@ -23,18 +22,13 @@
 
 import os
 import sys
-import gtk
-import gobject
-import zipimport
-import imp
-from thread import start_new_thread
-from traceback import extract_stack, extract_tb, format_list, print_exc
-from time import time
-from pynicotine import slskmessages
-from slskmessages import ToBeEncoded
-from logfacility import log
 
-WIN32 = sys.platform.startswith("win")
+from ast import literal_eval
+from time import time
+
+from pynicotine import slskmessages
+from pynicotine.logfacility import log
+
 
 returncode = {
     'break': 0,  # don't give other plugins the event, do let n+ process it
@@ -42,550 +36,504 @@ returncode = {
     'pass': 2    # do give other plugins the event, do let n+ process it
 }                # returning nothing is the same as 'pass'
 
-tupletype = type(('', ''))
 
+class PluginHandler:
 
-def cast_to_unicode_if_needed(text, logfunc):
-    if isinstance(text, unicode):
-        return text
-    try:
-        better = str.decode(text, 'utf8')
-        logfunc("Plugin problem: casting '%s' to unicode!" % repr(text))
-        return better
-    except UnicodeError:
-        better = str.decode(text, 'utf8', 'replace')
-        logfunc("Plugin problem: casting '%s' to unicode, losing characters in the process." % repr(text))
-        return better
-    except:
-        logfunc("Plugin problem: failed to completely cast '%s', you're on your own from here on." % repr(text))
-        return text
+    def __init__(self, core, config):
 
+        self.core = core
+        self.config = config
 
-class PluginHandler(object):
-
-    frame = None  # static variable... but should it be?
-    guiqueue = []  # fifo isn't supported by older python
-
-    def __init__(self, frame, plugindir=None):
-        self.frame = frame
-        log.add(_("Loading plugin handler"))
-        self.myUsername = self.frame.np.config.sections["server"]["login"]
         self.plugindirs = []
         self.enabled_plugins = {}
-        self.loaded_plugins = {}
-        self.type2cast = {
-            'integer': int,
-            'int': int,
-            'float': float,
-            'string': str,
-            'str': str
-        }
+        self.command_source = None
 
-        if not plugindir:
-            if WIN32:
-                try:
-                    mydir = os.path.join(os.environ['APPDATA'], 'nicotine')
-                except KeyError:
-                    # windows 9x?
-                    mydir, x = os.path.split(sys.argv[0])
-                self.plugindir = os.path.join(mydir, "plugins")
-            else:
-                self.plugindir = os.path.join(os.path.expanduser("~"), '.nicotine', 'plugins')
-        else:
-            self.plugindir = plugindir
         try:
-            os.makedirs(self.plugindir)
-        except:
+            os.makedirs(config.plugin_dir)
+        except Exception:
             pass
-        self.plugindirs.append(self.plugindir)
-        if os.path.isdir(self.plugindir):
-            # self.load_directory(self.plugindir)
-            self.load_enabled()
-        else:
-            log.add(_("It appears '%s' is not a directory, not loading plugins.") % self.plugindir)
 
-    def __findplugin(self, pluginname):
+        # Load system-wide plugins
+        prefix = os.path.dirname(os.path.realpath(__file__))
+        self.plugindirs.append(os.path.join(prefix, "plugins"))
+
+        # Load home directory plugins
+        self.plugindirs.append(config.plugin_dir)
+
+        BasePlugin.parent = self
+        BasePlugin.config = self.config
+        BasePlugin.core = self.core
+        BasePlugin.frame = self.core.ui_callback
+
+        self.load_enabled()
+
+    def quit(self):
+
+        # Notify plugins
+        self.shutdown_notification()
+
+        # Disable plugins
+        for plugin in self.list_installed_plugins():
+            self.disable_plugin(plugin)
+
+    def update_completions(self, plugin):
+
+        if not self.config.sections["words"]["commands"]:
+            return
+
+        if plugin.__publiccommands__:
+            self.core.chatrooms.update_completions()
+
+        if plugin.__privatecommands__:
+            self.core.privatechats.update_completions()
+
+    def findplugin(self, plugin_name):
         for directory in self.plugindirs:
-            fullpath = os.path.join(directory, pluginname)
+            fullpath = os.path.join(directory, plugin_name)
+
             if os.path.exists(fullpath):
                 return fullpath
+
         return None
 
-    def toggle_plugin(self, pluginname):
-        on = pluginname in self.enabled_plugins
-        if on:
-            self.disable_plugin(pluginname)
+    def toggle_plugin(self, plugin_name):
+
+        enabled = plugin_name in self.enabled_plugins
+
+        if enabled:
+            self.disable_plugin(plugin_name)
         else:
-            self.enable_plugin(pluginname)
+            self.enable_plugin(plugin_name)
 
-    def load_plugin(self, pluginname):
-        path = self.__findplugin(pluginname)
-        if path is None:
-            log.add(_("Failed to load plugin '%s', could not find it.") % pluginname)
-            return False
-        sys.path.insert(0, path)
-        plugin = imp.load_source(pluginname, os.path.join(path, '__init__.py'))
-        instance = plugin.Plugin(self)
-        self.plugin_settings(instance)
-        instance.LoadNotification()
-        # log.add("Loaded plugin %s (version %s) from %s" % (instance.__name__, instance.__version__, modulename))
-        # self.plugins.append((module, instance))
-        sys.path = sys.path[1:]
-        self.loaded_plugins[pluginname] = plugin
-        return plugin
+    def load_plugin(self, plugin_name):
 
-    def install_plugin(self, path):
         try:
-            tar = tarfile.open(path, "r:*")  # transparently supports gz, bz2
-        except (tarfile.ReadError, OSError):
-            raise InvalidPluginError(_('Plugin archive is not in the correct format'))
+            # Import builtin plugin
+            from importlib import import_module
+            plugin = import_module("pynicotine.plugins." + plugin_name)
 
-        # ensure the paths in the archive are sane
-        mems = tar.getmembers()
-        base = os.path.basename(path)[:-4]
-        if os.path.isdir(os.path.join(self.plugindirs[0], base)):
-            raise InvalidPluginError(_('A plugin with the name "%s" is '
-                                       'already installed') % base)
+        except Exception:
+            # Import user plugin
+            path = self.findplugin(plugin_name)
 
-        for m in mems:
-            if not m.name.startswith(base):
-                raise InvalidPluginError(_("Plugin archive contains an unsafe path"))
+            if path is None:
+                log.add(_("Failed to load plugin '%s', could not find it."), plugin_name)
+                return None
 
-        tar.extractall(self.plugindirs[0])
+            # Add plugin folder to path in order to support relative imports
+            sys.path.append(path)
 
-    def uninstall_plugin(self, pluginname):
-        self.disable_plugin(pluginname)
-        for dir in self.plugindirs:
-            try:
-                shutil.rmtree(self.__findplugin(pluginname))
-                return True
-            except:
-                pass
-        return False
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(plugin_name, os.path.join(path, '__init__.py'))
+            plugin = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin)
 
-    def enable_plugin(self, pluginname):
-        if pluginname in self.enabled_plugins:
-            return
-        try:
-            plugin = self.load_plugin(pluginname)
-            if not plugin:
-                raise Exception("Error loading plugin '%s'" % pluginname)
-            plugin.enable(self)
-            self.enabled_plugins[pluginname] = plugin
-            log.add(_("Enabled plugin %s") % plugin.PLUGIN.__name__)
-        except:
-            print_exc()
-            log.addwarning(_("Unable to enable plugin %s") % pluginname)
-            # common.log_exception(logger)
+        instance = plugin.Plugin()
+        instance.internal_name = BasePlugin.internal_name
+        instance.human_name = BasePlugin.human_name
+
+        self.plugin_settings(plugin_name, instance)
+
+        if hasattr(plugin, "enable"):
+            instance.log("top-level enable() function is obsolete, please use BasePlugin.__init__() instead")
+
+        if hasattr(plugin, "disable"):
+            instance.log("top-level disable() function is obsolete, please use BasePlugin.disable() instead")
+
+        if hasattr(instance, "LoadNotification"):
+            instance.log("LoadNotification() is obsolete, please use init()")
+
+        return instance
+
+    def enable_plugin(self, plugin_name):
+
+        # Our config file doesn't play nicely with some characters
+        if "=" in plugin_name:
+            log.add(
+                _("Unable to load plugin %(name)s. Plugin folder name contains invalid characters: %(characters)s"), {
+                    "name": plugin_name,
+                    "characters": "="
+                })
             return False
+
+        if plugin_name in self.enabled_plugins:
+            return False
+
+        try:
+            BasePlugin.internal_name = plugin_name
+            BasePlugin.human_name = self.get_plugin_info(plugin_name).get("Name", plugin_name)
+
+            plugin = self.load_plugin(plugin_name)
+
+            if plugin is None:
+                return False
+
+            plugin.init()
+
+            for trigger, _func in plugin.__publiccommands__:
+                self.core.chatrooms.CMDS.add('/' + trigger + ' ')
+
+            for trigger, _func in plugin.__privatecommands__:
+                self.core.privatechats.CMDS.add('/' + trigger + ' ')
+
+            self.update_completions(plugin)
+
+            self.enabled_plugins[plugin_name] = plugin
+            plugin.loaded_notification()
+            log.add(_("Loaded plugin %s"), plugin.human_name)
+
+        except Exception:
+            from traceback import format_exc
+            log.add(_("Unable to load plugin %(module)s\n%(exc_trace)s"),
+                    {'module': plugin_name, 'exc_trace': format_exc()})
+            return False
+
         return True
 
     def list_installed_plugins(self):
         pluginlist = []
-        for dir in self.plugindirs:
-            if os.path.exists(dir):
-                for file in os.listdir(dir):
-                    if file not in pluginlist and os.path.isdir(os.path.join(dir, file)):
+
+        for folder in self.plugindirs:
+            if os.path.isdir(folder):
+                for file in os.listdir(folder):
+                    if file not in pluginlist and os.path.isdir(os.path.join(folder, file)):
                         pluginlist.append(file)
+
         return pluginlist
 
-    def disable_plugin(self, pluginname):
-        if pluginname not in self.enabled_plugins:
-            return
-        try:
-            plugin = self.enabled_plugins[pluginname]
-            log.add(_("Disabled plugin {}".format(plugin.PLUGIN.__name__)))
-            del self.enabled_plugins[pluginname]
-            plugin.disable(self)
-        except:
-            print_exc()
-            log.addwarning(_("Unable to fully disable plugin %s") % pluginname)
-            # common.log_exception(logger)
+    def disable_plugin(self, plugin_name):
+        if plugin_name not in self.enabled_plugins:
             return False
+
+        plugin = self.enabled_plugins[plugin_name]
+        path = self.findplugin(plugin_name)
+
+        try:
+            plugin.disable()
+
+            for trigger, _func in plugin.__publiccommands__:
+                self.core.chatrooms.CMDS.remove('/' + trigger + ' ')
+
+            for trigger, _func in plugin.__privatecommands__:
+                self.core.privatechats.CMDS.remove('/' + trigger + ' ')
+
+            self.update_completions(plugin)
+            plugin.unloaded_notification()
+            log.add(_("Unloaded plugin %s"), plugin.human_name)
+
+        except Exception:
+            from traceback import format_exc
+            log.add(_("Unable to unload plugin %(module)s\n%(exc_trace)s"),
+                    {'module': plugin_name, 'exc_trace': format_exc()})
+            return False
+
+        finally:
+            # Remove references to relative modules
+            if path in sys.path:
+                sys.path.remove(path)
+
+            for name, module in list(sys.modules.items()):
+                try:
+                    if module.__file__.startswith(path):
+                        sys.modules.pop(name, None)
+                        del module
+
+                except AttributeError:
+                    # Builtin module
+                    continue
+
+            del self.enabled_plugins[plugin_name]
+            del plugin
+
         return True
 
-    def get_plugin_settings(self, pluginname):
-        if pluginname in self.enabled_plugins:
-            plugin = self.enabled_plugins[pluginname]
-            if hasattr(plugin.PLUGIN, "metasettings"):
-                return plugin.PLUGIN.metasettings
+    def get_plugin_settings(self, plugin_name):
+        if plugin_name in self.enabled_plugins:
+            plugin = self.enabled_plugins[plugin_name]
 
-    def get_plugin_info(self, pluginname):
-        path = os.path.join(self.__findplugin(pluginname), 'PLUGININFO')
-        f = open(path)
+            if plugin.metasettings:
+                return plugin.metasettings
+
+        return None
+
+    def get_plugin_info(self, plugin_name):
+
         infodict = {}
-        for line in f:
-            try:
-                key, val = line.split("=", 1)
-                infodict[key] = eval(val)
-            except ValueError:
-                pass  # this happens on blank lines
+        plugin_folder = self.findplugin(plugin_name)
+
+        if plugin_folder is None:
+            return infodict
+
+        info_path = os.path.join(self.findplugin(plugin_name), 'PLUGININFO')
+
+        with open(info_path, encoding="utf-8") as file_handle:
+            for line in file_handle:
+                try:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+
+                    # Translatable string
+                    if value.startswith("_(") and value.endswith(")"):
+                        infodict[key] = _(literal_eval(value[2:-1]))
+                        continue
+
+                    infodict[key] = literal_eval(value)
+
+                except Exception:
+                    pass  # this can happen on blank lines
+
         return infodict
 
-    def save_enabled(self):
-        self.frame.np.config.sections["plugins"]["enabled"] = list(self.enabled_plugins.keys())
+    @staticmethod
+    def show_plugin_error(plugin_name, exc_type, exc_value, exc_traceback):
 
-    def check_enabled(self):
-        if self.frame.np.config.sections["plugins"]["enable"]:
-            self.load_enabled()
-        else:
-            to_enable = self.frame.np.config.sections["plugins"]["enabled"]
-            for plugin in self.enabled_plugins:
-                self.enabled_plugins[plugin].disable(self)
+        from traceback import format_tb
+
+        log.add(_("Plugin %(module)s failed with error %(errortype)s: %(error)s.\n"
+                  "Trace: %(trace)s"), {
+            'module': plugin_name,
+            'errortype': exc_type,
+            'error': exc_value,
+            'trace': ''.join(format_tb(exc_traceback))
+        })
+
+    def save_enabled(self):
+        self.config.sections["plugins"]["enabled"] = list(self.enabled_plugins.keys())
 
     def load_enabled(self):
-        enable = self.frame.np.config.sections["plugins"]["enable"]
+        enable = self.config.sections["plugins"]["enable"]
+
         if not enable:
             return
-        to_enable = self.frame.np.config.sections["plugins"]["enabled"]
+
+        log.add(_("Loading plugin system"))
+
+        to_enable = self.config.sections["plugins"]["enabled"]
+        log.add_debug("Enabled plugin(s): %s" % ', '.join(to_enable))
+
         for plugin in to_enable:
             self.enable_plugin(plugin)
 
-    def plugin_settings(self, plugin):
+    def plugin_settings(self, plugin_name, plugin):
+        plugin_name = plugin_name.lower()
         try:
-            if not hasattr(plugin, "settings"):
+            if not plugin.settings:
                 return
-            if plugin.__id__ not in self.frame.np.config.sections["plugins"]:
-                self.frame.np.config.sections["plugins"][plugin.__id__] = plugin.settings
+
+            if plugin_name not in self.config.sections["plugins"]:
+                self.config.sections["plugins"][plugin_name] = plugin.settings
+
             for i in plugin.settings:
-                if i not in self.frame.np.config.sections["plugins"][plugin.__id__]:
-                    self.frame.np.config.sections["plugins"][plugin.__id__][i] = plugin.settings[i]
-            customsettings = self.frame.np.config.sections["plugins"][plugin.__id__]
+                if i not in self.config.sections["plugins"][plugin_name]:
+                    self.config.sections["plugins"][plugin_name][i] = plugin.settings[i]
+
+            customsettings = self.config.sections["plugins"][plugin_name]
 
             for key in customsettings:
                 if key in plugin.settings:
                     plugin.settings[key] = customsettings[key]
 
                 else:
-                    log.add(_("Stored setting '%(name)s' is no longer present in the plugin") % {'name': key})
+                    log.add_debug("Stored setting '%(key)s' is no longer present in the '%(name)s' plugin", {
+                        'key': key,
+                        'name': plugin_name
+                    })
+
         except KeyError:
-            log.add("No custom settings found for %s" % (plugin.__name__,))
-            pass
+            log.add_debug("No stored settings found for %s", plugin.human_name)
 
-    def TriggerPublicCommandEvent(self, room, command, args):
-        return self._TriggerCommand("plugin.PLUGIN.PublicCommandEvent", command, room, args)
+    def trigger_public_command_event(self, room, command, args):
+        return self._trigger_command(command, room, args, public_command=True)
 
-    def TriggerPrivateCommandEvent(self, user, command, args):
-        return self._TriggerCommand("plugin.PLUGIN.PrivateCommandEvent", command, user, args)
+    def trigger_private_command_event(self, user, command, args):
+        return self._trigger_command(command, user, args, public_command=False)
 
-    def _TriggerCommand(self, strfunc, command, source, args):
-        for module, plugin in list(self.enabled_plugins.items()):
+    def _trigger_command(self, command, source, args, public_command):
+
+        self.command_source = (public_command, source)
+
+        for module, plugin in self.enabled_plugins.items():
+            if plugin is None:
+                continue
+
+            return_value = None
+            commands = plugin.__publiccommands__ if public_command else plugin.__privatecommands__
+
             try:
-                if plugin.PLUGIN is None:
-                    continue
-                func = eval(strfunc)
-                ret = func(command, source, args)
-                if ret is not None:
-                    if ret == returncode['zap']:
-                        return True
-                    elif ret == returncode['pass']:
-                        pass
-                    else:
-                        log.add(_("Plugin %(module)s returned something weird, '%(value)s', ignoring") % {'module': module, 'value': str(ret)})
-            except:
-                log.add(_("Plugin %(module)s failed with error %(errortype)s: %(error)s.\nTrace: %(trace)s\nProblem area:%(area)s") % {
-                            'module': module,
-                            'errortype': sys.exc_info()[0],
-                            'error': sys.exc_info()[1],
-                            'trace': ''.join(format_list(extract_stack())),
-                            'area': ''.join(format_list(extract_tb(sys.exc_info()[2])))
-                        })
+                for trigger, func in commands:
+                    if trigger == command:
+                        return_value = getattr(plugin, func.__name__)(source, args)
+
+            except Exception:
+                self.show_plugin_error(module, sys.exc_info()[0], sys.exc_info()[1], sys.exc_info()[2])
+                continue
+
+            if return_value is None:
+                # Nothing changed, continue to the next plugin
+                continue
+
+            if return_value == returncode['zap']:
+                self.command_source = None
+                return True
+
+            if return_value == returncode['pass']:
+                continue
+
+            log.add_debug("Plugin %(module)s returned something weird, '%(value)s', ignoring",
+                          {'module': module, 'value': str(return_value)})
+
+        self.command_source = None
         return False
 
-    def TriggerEvent(self, function, args):
-        """Triggers an event for the plugins. Since events and notifications
+    def trigger_event(self, function_name, args):
+        """ Triggers an event for the plugins. Since events and notifications
         are precisely the same except for how n+ responds to them, both can be
-        triggered by this function."""
-        hotpotato = args
-        for module, plugin in list(self.enabled_plugins.items()):
+        triggered by this function. """
+
+        function_name_camelcase = function_name.title().replace('_', '')
+
+        for module, plugin in self.enabled_plugins.items():
             try:
-                func = eval("plugin.PLUGIN." + function)
-                ret = func(*hotpotato)
-                if ret is not None and type(ret) != tupletype:
-                    if ret == returncode['zap']:
-                        return None
-                    elif ret == returncode['break']:
-                        return hotpotato
-                    elif ret == returncode['pass']:
-                        pass
-                    else:
-                        log.add(_("Plugin %(module)s returned something weird, '%(value)s', ignoring") % {'module': module, 'value': ret})
-                if ret is not None:
-                    hotpotato = ret
-            except:
-                log.add(_("Plugin %(module)s failed with error %(errortype)s: %(error)s.\nTrace: %(trace)s\nProblem area:%(area)s") % {
-                            'module': module,
-                            'errortype': sys.exc_info()[0],
-                            'error': sys.exc_info()[1],
-                            'trace': ''.join(format_list(extract_stack())),
-                            'area': ''.join(format_list(extract_tb(sys.exc_info()[2])))
-                        })
-        return hotpotato
+                if hasattr(plugin, function_name_camelcase):
+                    plugin.log("%(old_function)s is deprecated, please use %(new_function)s" % {
+                        "old_function": function_name_camelcase,
+                        "new_function": function_name
+                    })
+                    return_value = getattr(plugin, function_name_camelcase)(*args)
+                else:
+                    return_value = getattr(plugin, function_name)(*args)
 
-    def SearchRequestNotification(self, searchterm, user, searchid):
-        start_new_thread(self.TriggerEvent, ("SearchRequestNotification", (searchterm, user, searchid)))
+            except Exception:
+                self.show_plugin_error(module, sys.exc_info()[0], sys.exc_info()[1], sys.exc_info()[2])
+                continue
 
-    def DistribSearchNotification(self, searchterm, user, searchid):
-        start_new_thread(self.TriggerEvent, ("DistribSearchNotification", (searchterm, user, searchid)))
+            if return_value is None:
+                # Nothing changed, continue to the next plugin
+                continue
 
-    def PublicRoomMessageNotification(self, room, user, line):
-        start_new_thread(self.TriggerEvent, ("PublicRoomMessageNotification", (room, user, line)))
+            if isinstance(return_value, tuple):
+                # The original args were modified, update them
+                args = return_value
+                continue
 
-    def IncomingPrivateChatEvent(self, user, line):
-        if user != self.myUsername:
+            if return_value == returncode['zap']:
+                return None
+
+            if return_value == returncode['break']:
+                return args
+
+            if return_value == returncode['pass']:
+                continue
+
+            log.add_debug("Plugin %(module)s returned something weird, '%(value)s', ignoring",
+                          {'module': module, 'value': return_value})
+
+        return args
+
+    def search_request_notification(self, searchterm, user, token):
+        self.trigger_event("search_request_notification", (searchterm, user, token))
+
+    def distrib_search_notification(self, searchterm, user, token):
+        self.trigger_event("distrib_search_notification", (searchterm, user, token))
+
+    def public_room_message_notification(self, room, user, line):
+        self.trigger_event("public_room_message_notification", (room, user, line))
+
+    def incoming_private_chat_event(self, user, line):
+        if user != self.core.login_username:
             # dont trigger the scripts on our own talking - we've got "Outgoing" for that
-            return self.TriggerEvent("IncomingPrivateChatEvent", (user, line))
-        else:
-            return (user, line)
+            return self.trigger_event("incoming_private_chat_event", (user, line))
 
-    def IncomingPrivateChatNotification(self, user, line):
-        start_new_thread(self.TriggerEvent, ("IncomingPrivateChatNotification", (user, line)))
+        return (user, line)
 
-    def IncomingPublicChatEvent(self, room, user, line):
-        return self.TriggerEvent("IncomingPublicChatEvent", (room, user, line))
+    def incoming_private_chat_notification(self, user, line):
+        self.trigger_event("incoming_private_chat_notification", (user, line))
 
-    def IncomingPublicChatNotification(self, room, user, line):
-        start_new_thread(self.TriggerEvent, ("IncomingPublicChatNotification", (room, user, line)))
+    def incoming_public_chat_event(self, room, user, line):
+        return self.trigger_event("incoming_public_chat_event", (room, user, line))
 
-    def OutgoingPrivateChatEvent(self, user, line):
+    def incoming_public_chat_notification(self, room, user, line):
+        self.trigger_event("incoming_public_chat_notification", (room, user, line))
+
+    def outgoing_private_chat_event(self, user, line):
         if line is not None:
             # if line is None nobody actually said anything
-            return self.TriggerEvent("OutgoingPrivateChatEvent", (user, line))
-        else:
-            return (user, line)
+            return self.trigger_event("outgoing_private_chat_event", (user, line))
 
-    def OutgoingPrivateChatNotification(self, user, line):
-        start_new_thread(self.TriggerEvent, ("OutgoingPrivateChatNotification", (user, line)))
+        return (user, line)
 
-    def OutgoingPublicChatEvent(self, room, line):
-        return self.TriggerEvent("OutgoingPublicChatEvent", (room, line))
+    def outgoing_private_chat_notification(self, user, line):
+        self.trigger_event("outgoing_private_chat_notification", (user, line))
 
-    def OutgoingPublicChatNotification(self, room, line):
-        start_new_thread(self.TriggerEvent, ("OutgoingPublicChatNotification", (room, line)))
+    def outgoing_public_chat_event(self, room, line):
+        return self.trigger_event("outgoing_public_chat_event", (room, line))
 
-    def OutgoingGlobalSearchEvent(self, text):
-        return self.TriggerEvent("OutgoingGlobalSearchEvent", (text,))
+    def outgoing_public_chat_notification(self, room, line):
+        self.trigger_event("outgoing_public_chat_notification", (room, line))
 
-    def OutgoingRoomSearchEvent(self, rooms, text):
-        return self.TriggerEvent("OutgoingRoomSearchEvent", (rooms, text))
+    def outgoing_global_search_event(self, text):
+        return self.trigger_event("outgoing_global_search_event", (text,))
 
-    def OutgoingBuddySearchEvent(self, text):
-        return self.TriggerEvent("OutgoingBuddySearchEvent", (text,))
+    def outgoing_room_search_event(self, rooms, text):
+        return self.trigger_event("outgoing_room_search_event", (rooms, text))
 
-    def OutgoingUserSearchEvent(self, users):
-        return self.TriggerEvent("OutgoingUserSearchEvent", (users,))
+    def outgoing_buddy_search_event(self, text):
+        return self.trigger_event("outgoing_buddy_search_event", (text,))
 
-    def UserResolveNotification(self, user, ip, port, country=None):
+    def outgoing_user_search_event(self, users, text):
+        return self.trigger_event("outgoing_user_search_event", (users, text))
+
+    def user_resolve_notification(self, user, ip_address, port, country=None):
         """Notification for user IP:Port resolving.
 
         Note that country is only set when the user requested the resolving"""
-        start_new_thread(self.TriggerEvent, ("UserResolveNotification", (user, ip, port, country)))
+        self.trigger_event("user_resolve_notification", (user, ip_address, port, country))
 
-    def ServerConnectNotification(self):
-        start_new_thread(self.TriggerEvent, ("ServerConnectNotification", (),))
+    def server_connect_notification(self):
+        self.trigger_event("server_connect_notification", (),)
 
-    def ServerDisconnectNotification(self, userchoice):
-        start_new_thread(self.TriggerEvent, ("ServerDisconnectNotification", (userchoice, )))
+    def server_disconnect_notification(self, userchoice):
+        self.trigger_event("server_disconnect_notification", (userchoice, ))
 
-    def JoinChatroomNotification(self, room):
-        start_new_thread(self.TriggerEvent, ("JoinChatroomNotification", (room,)))
+    def join_chatroom_notification(self, room):
+        self.trigger_event("join_chatroom_notification", (room,))
 
-    def LeaveChatroomNotification(self, room):
-        start_new_thread(self.TriggerEvent, ("LeaveChatroomNotification", (room,)))
+    def leave_chatroom_notification(self, room):
+        self.trigger_event("leave_chatroom_notification", (room,))
 
-    def UploadQueuedNotification(self, user, virtualfile, realfile):
-        start_new_thread(self.TriggerEvent, ("UploadQueuedNotification", (user, virtualfile, realfile)))
+    def user_join_chatroom_notification(self, room, user):
+        self.trigger_event("user_join_chatroom_notification", (room, user,))
 
-    def UserStatsNotification(self, user, stats):
-        start_new_thread(self.TriggerEvent, ("UserStatsNotification", (user, stats)))
+    def user_leave_chatroom_notification(self, room, user):
+        self.trigger_event("user_leave_chatroom_notification", (room, user,))
 
-    # other functions
-    def appendqueue(self, item):
-        # We cannot do a test after adding the item since it's possible
-        # this function will be called twice simultaneously - and then
-        # len(self.guiqueue) might be 2 for both calls.
-        # Calling the processQueue twice is not a problem though.
-        addidle = False
-        self.guiqueue.append(item)
-        if len(self.guiqueue) >= 0:
-            addidle = True
-        if addidle:
-            gobject.idle_add(self.processQueue)
+    def user_stats_notification(self, user, stats):
+        self.trigger_event("user_stats_notification", (user, stats))
 
-    def log(self, text):
-        self.appendqueue({'type': 'logtext', 'text': text})
+    def user_status_notification(self, user, status, privileged):
+        self.trigger_event("user_status_notification", (user, status, privileged))
 
-    def saychatroom(self, room, text):
-        text = cast_to_unicode_if_needed(text, log.addwarning)
-        self.frame.np.queue.put(slskmessages.SayChatroom(room, ToBeEncoded(text, 'UTF-8')))
+    def upload_queued_notification(self, user, virtual_path, real_path):
+        self.trigger_event("upload_queued_notification", (user, virtual_path, real_path))
 
-    def sayprivate(self, user, text):
-        '''Send user message in private (showing up in GUI)'''
-        self.appendqueue({'type': 'sayprivate', 'user': user, 'text': text})
+    def upload_started_notification(self, user, virtual_path, real_path):
+        self.trigger_event("upload_started_notification", (user, virtual_path, real_path))
 
-    def sendprivate(self, user, text):
-        '''Send user message in private (not showing up in GUI)'''
-        self.appendqueue({'type': 'sendprivate', 'user': user, 'text': text})
+    def upload_finished_notification(self, user, virtual_path, real_path):
+        self.trigger_event("upload_finished_notification", (user, virtual_path, real_path))
 
-    def processQueue(self):
-        while len(self.guiqueue) > 0:
-            i = self.guiqueue.pop(0)
-            if i['type'] == 'logtext':
-                log.add(i['text'])
-            elif i['type'] == 'sayprivate':
-                # If we use the np the chat lines only show up on the receiving end, we won't see anything ourselves.
-                self.frame.privatechats.users[i['user']].SendMessage(i['text'])
-            elif i['type'] == 'sendprivate':
-                self.frame.privatechats.SendMessage(i['user'], i['text'])
-            else:
-                log.add(_('Unknown queue item %(type)s: %(item)s' % {
-                    'type': i['type'],
-                    'item': repr(i)
-                }))
-        return False
+    def download_started_notification(self, user, virtual_path, real_path):
+        self.trigger_event("download_started_notification", (user, virtual_path, real_path))
+
+    def download_finished_notification(self, user, virtual_path, real_path):
+        self.trigger_event("download_finished_notification", (user, virtual_path, real_path))
+
+    def shutdown_notification(self):
+        self.trigger_event("shutdown_notification", (),)
 
 
-class BasePlugin(object):
-
-    __name__ = "BasePlugin"
-    __desc__ = "No description provided"
-    # __id__ = "baseplugin_original" # you normally don't have to set this manually
-    __version__ = "2016-08-30"
-    __publiccommands__ = []
-    __privatecommands__ = []
-
-    def __init__(self, parent):
-        # Never override this function, override init() instead
-        self.parent = parent
-        self.frame = parent.frame
-        try:
-            self.__id__
-        except AttributeError:
-            # See http://docs.python.org/library/configparser.html
-            # %(name)s will lead to replacements so we need to filter out those symbols.
-            self.__id__ = self.__name__.lower().replace(' ', '_').replace('%', '_').replace('=', '_')
-        self.init()
-        for (trigger, func) in self.__publiccommands__:
-            self.frame.chatrooms.roomsctrl.CMDS.add('/'+trigger+' ')
-        for (trigger, func) in self.__privatecommands__:
-            self.frame.privatechats.CMDS.add('/'+trigger+' ')
-
-    def init(self):
-        pass
-
-    def LoadSettings(self, settings):
-        self.settings = settings
-
-    def LoadNotification(self):
-        pass
-
-    def PublicRoomMessageNotification(self, room, user, line):
-        pass
-
-    def SearchRequestNotification(self, searchterm, user, searchid):
-        pass
-
-    def DistribSearchNotification(self, searchterm, user, searchid):
-        pass
-
-    def IncomingPrivateChatEvent(self, user, line):
-        pass
-
-    def IncomingPrivateChatNotification(self, user, line):
-        pass
-
-    def IncomingPublicChatEvent(self, room, user, line):
-        pass
-
-    def IncomingPublicChatNotification(self, room, user, line):
-        pass
-
-    def OutgoingPrivateChatEvent(self, user, line):
-        pass
-
-    def OutgoingPrivateChatNotification(self, user, line):
-        pass
-
-    def OutgoingPublicChatEvent(self, room, line):
-        pass
-
-    def OutgoingPublicChatNotification(self, room, line):
-        pass
-
-    def OutgoingGlobalSearchEvent(self, text):
-        pass
-
-    def OutgoingRoomSearchEvent(self, rooms, text):
-        pass
-
-    def OutgoingBuddySearchEvent(self, text):
-        pass
-
-    def OutgoingUserSearchEvent(self, users):
-        pass
-
-    def UserResolveNotification(self, user, ip, port, country):
-        pass
-
-    def ServerConnectNotification(self):
-        pass
-
-    def ServerDisconnectNotification(self, userchoice):
-        pass
-
-    def JoinChatroomNotification(self, room):
-        pass
-
-    def LeaveChatroomNotification(self, room):
-        pass
-
-    def UploadQueuedNotification(self, user, virtualfile, realfile):
-        pass
-
-    def UserStatsNotification(self, user, stats):
-        pass
-
-    # The following are functions to make your life easier,
-    # you shouldn't override them.
-    def log(self, text):
-        self.parent.log(self.__name__ + ": " + text)
-
-    def saypublic(self, room, text):
-        self.parent.saychatroom(room, text)
-
-    def sayprivate(self, user, text):
-        '''Send user message in private (shows up in GUI)'''
-        self.parent.sayprivate(user, text)
-
-    def sendprivate(self, user, text):
-        '''Send user message in private (doesn't show up in GUI)'''
-        self.parent.sendprivate(user, text)
-
-    def fakepublic(self, room, user, text):
-        try:
-            room = self.frame.chatrooms.roomsctrl.joinedrooms[room]
-        except KeyError:
-            return False
-        text = cast_to_unicode_if_needed(text, self.log)
-        msg = slskmessages.SayChatroom(room, ToBeEncoded(text, 'UTF-8'))
-        msg.user = user
-        room.SayChatRoom(msg, text)
-        return True
-
-    # The following are functions used by the plugin system,
-    # you are not allowed to override these.
-    def PublicCommandEvent(self, command, room, args):
-        for (trigger, func) in self.__publiccommands__:
-            if trigger == command:
-                return func(self, room, args)
-
-    def PrivateCommandEvent(self, command, user, args):
-        for (trigger, func) in self.__privatecommands__:
-            if trigger == command:
-                return func(self, user, args)
-
-
-class ResponseThrottle(object):
+class ResponseThrottle:
 
     """
     ResponseThrottle - Mutnick 2016
@@ -599,21 +547,27 @@ class ResponseThrottle(object):
     Some of the throttle logic is guesswork as server code is closed source, but works adequately.
     """
 
-    def __init__(self, frame, plugin_name, logging=False):
-        self.frame = frame
+    def __init__(self, core, plugin_name, logging=False):
+
+        self.core = core
         self.plugin_name = plugin_name
         self.logging = logging
         self.plugin_usage = {}
 
+        self.room = None
+        self.nick = None
+        self.request = None
+
     def ok_to_respond(self, room, nick, request, seconds_limit_min=30):
+
         self.room = room
         self.nick = nick
         self.request = request
-        
+
         willing_to_respond = True
         current_time = time()
 
-        if room not in list(self.plugin_usage.keys()):
+        if room not in self.plugin_usage:
             self.plugin_usage[room] = {'last_time': 0, 'last_request': "", 'last_nick': ""}
 
         last_time = self.plugin_usage[room]['last_time']
@@ -622,41 +576,248 @@ class ResponseThrottle(object):
 
         port = False
         try:
-            ip, port = self.frame.np.users[nick].addr
-        except:
+            _ip_address, port = self.core.protothread.user_addresses[nick]
+        except Exception:
             port = True
 
-        if nick in self.frame.np.config.sections["server"]["ignorelist"]:
+        if self.core.network_filter.is_user_ignored(nick):
             willing_to_respond, reason = False, "The nick is ignored"
-        elif self.frame.UserIpIsIgnored(nick):
+
+        elif self.core.network_filter.is_user_ip_ignored(nick):
             willing_to_respond, reason = False, "The nick's Ip is ignored"
+
         elif not port:
             willing_to_respond, reason = False, "Request likely from simple PHP based griefer bot"
+
         elif [nick, request] == [last_nick, last_request]:
             if (current_time - last_time) < 12 * seconds_limit_min:
                 willing_to_respond, reason = False, "Too soon for same nick to request same resource in room"
-        elif (request == last_request):
+
+        elif request == last_request:
             if (current_time - last_time) < 3 * seconds_limit_min:
                 willing_to_respond, reason = False, "Too soon for different nick to request same resource in room"
+
         else:
             recent_responses = 0
-            for responded_room in self.plugin_usage:
-                if (current_time - self.plugin_usage[responded_room]['last_time']) < seconds_limit_min:
+
+            for responded_room, room_dict in self.plugin_usage.items():
+                if (current_time - room_dict['last_time']) < seconds_limit_min:
                     recent_responses += 1
+
                     if responded_room == room:
                         willing_to_respond, reason = False, "Responded in specified room too recently"
                         break
+
             if recent_responses > 3:
                 willing_to_respond, reason = False, "Responded in multiple rooms enough"
 
-        if self.logging:
-            if not willing_to_respond:
-                base_log_msg = "{} plugin request rejected - room '{}', nick '{}'".format(self.plugin_name, room, nick)
-                log.adddebug("{} - {}".format(base_log_msg, reason))
+        if self.logging and not willing_to_respond:
+            base_log_msg = "{} plugin request rejected - room '{}', nick '{}'".format(self.plugin_name, room, nick)
+            log.add_debug("{} - {}".format(base_log_msg, reason))
 
         return willing_to_respond
 
-    def responded(self, msg=""):
+    def responded(self):
         # possible TODO's: we could actually say public the msg here
         # make more stateful - track past msg's as additional responder willingness criteria, etc
         self.plugin_usage[self.room] = {'last_time': time(), 'last_request': self.request, 'last_nick': self.nick}
+
+
+class BasePlugin:
+
+    __publiccommands__ = []
+    __privatecommands__ = []
+    settings = {}
+    metasettings = {}
+
+    internal_name = None
+    human_name = None
+    parent = None
+    config = None
+    core = None
+    frame = None
+
+    def __init__(self):
+        # The plugin class is initializing, plugin settings are not available yet
+        pass
+
+    def init(self):
+        # Called after __init__() when plugin settings have loaded
+        pass
+
+    def loaded_notification(self):
+        # The plugin has finished loaded (settings are loaded at this stage)
+        pass
+
+    def disable(self):
+        # The plugin has started unloading
+        pass
+
+    def unloaded_notification(self):
+        # The plugin has finished unloading
+        pass
+
+    def shutdown_notification(self):
+        # Application is shutting down
+        pass
+
+    def public_room_message_notification(self, room, user, line):
+        pass
+
+    def search_request_notification(self, searchterm, user, token):
+        pass
+
+    def distrib_search_notification(self, searchterm, user, token):
+        pass
+
+    def incoming_private_chat_event(self, user, line):
+        pass
+
+    def incoming_private_chat_notification(self, user, line):
+        pass
+
+    def incoming_public_chat_event(self, room, user, line):
+        pass
+
+    def incoming_public_chat_notification(self, room, user, line):
+        pass
+
+    def outgoing_private_chat_event(self, user, line):
+        pass
+
+    def outgoing_private_chat_notification(self, user, line):
+        pass
+
+    def outgoing_public_chat_event(self, room, line):
+        pass
+
+    def outgoing_public_chat_notification(self, room, line):
+        pass
+
+    def outgoing_global_search_event(self, text):
+        pass
+
+    def outgoing_room_search_event(self, rooms, text):
+        pass
+
+    def outgoing_buddy_search_event(self, text):
+        pass
+
+    def outgoing_user_search_event(self, users, text):
+        pass
+
+    def user_resolve_notification(self, user, ip_address, port, country):
+        pass
+
+    def server_connect_notification(self):
+        pass
+
+    def server_disconnect_notification(self, userchoice):
+        pass
+
+    def join_chatroom_notification(self, room):
+        pass
+
+    def leave_chatroom_notification(self, room):
+        pass
+
+    def user_join_chatroom_notification(self, room, user):
+        pass
+
+    def user_leave_chatroom_notification(self, room, user):
+        pass
+
+    def user_stats_notification(self, user, stats):
+        pass
+
+    def user_status_notification(self, user, status, privileged):
+        pass
+
+    def upload_queued_notification(self, user, virtual_path, real_path):
+        pass
+
+    def upload_started_notification(self, user, virtual_path, real_path):
+        pass
+
+    def upload_finished_notification(self, user, virtual_path, real_path):
+        pass
+
+    def download_started_notification(self, user, virtual_path, real_path):
+        pass
+
+    def download_finished_notification(self, user, virtual_path, real_path):
+        pass
+
+    # The following are functions to make your life easier,
+    # you shouldn't override them.
+
+    def log(self, msg, msg_args=None):
+        log.add(self.human_name + ": " + msg, msg_args)
+
+    def send_public(self, room, text):
+        self.core.queue.append(slskmessages.SayChatroom(room, text))
+
+    def send_private(self, user, text, show_ui=True, switch_page=True):
+        """ Send user message in private.
+        show_ui controls if the UI opens a private chat view for the user.
+        switch_page controls whether the user's private chat view should be opened. """
+
+        if show_ui:
+            self.core.privatechats.show_user(user, switch_page)
+
+        self.core.privatechats.send_message(user, text)
+
+    def echo_public(self, room, text, message_type="local"):
+        """ Display a raw message in chat rooms (not sent to others).
+        message_type changes the type (and color) of the message in the UI.
+        available message_type values: action, remote, local, hilite """
+
+        self.core.chatrooms.echo_message(room, text, message_type)
+
+    def echo_private(self, user, text, message_type="local"):
+        """ Display a raw message in private (not sent to others).
+        message_type changes the type (and color) of the message in the UI.
+        available message_type values: action, remote, local, hilite """
+
+        self.core.privatechats.show_user(user)
+        self.core.privatechats.echo_message(user, text, message_type)
+
+    def send_message(self, text):
+        """ Convenience function to send a message to the same user/room
+        a plugin command runs for """
+
+        if self.parent.command_source is None:
+            # Function was not called from a command
+            return
+
+        public_command, source = self.parent.command_source
+        function = self.send_public if public_command else self.send_private
+
+        function(source, text)
+
+    def echo_message(self, text, message_type="local"):
+        """ Convenience function to display a raw message the same window
+        a plugin command runs from """
+
+        if self.parent.command_source is None:
+            # Function was not called from a command
+            return
+
+        public_command, source = self.parent.command_source
+        function = self.echo_public if public_command else self.echo_private
+
+        function(source, text, message_type)
+
+    # Obsolete functions
+
+    def saypublic(self, _room, _text):
+        self.log("saypublic(room, text) is obsolete, please use send_public(room, text)")
+
+    def sayprivate(self, _user, _text):
+        self.log("sayprivate(user, text) is obsolete, please use send_private(user, text)")
+
+    def sendprivate(self, _user, _text):
+        self.log("sendprivate(user, text) is obsolete, please use send_private(user, text, show_ui=False)")
+
+    def fakepublic(self, _room, _user, _text):
+        self.log("fakepublic(room, user, text) is obsolete, please use echo_public(room, text)")

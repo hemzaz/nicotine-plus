@@ -1,93 +1,101 @@
-## For a list of translators see [TRANSLATORS](TRANSLATORS.md)
+# Translations
 
-If your name is missing: please contact us.
+## How to Translate
 
----
+You can help improving our translations at [Hosted Weblate](https://hosted.weblate.org/engage/nicotine-plus). You don't even need an account.
 
-# Translators
+We regularly import the improved translations into the Nicotine+ GitHub repository, especially before a new Nicotine+ release.
 
-### HowTo translate
+Look around in the Weblate interface, there are quite a few very practical options.
 
-##### To create a new language:
 
-1. Create a directory `languages/$(your_lang)/LC_MESSAGES/` for your translation.
+### Automatic Translations
 
-2. Copy the `nicotine.pot` to that subdirectory and rename it to `nicotine.po`.
+This will translate all strings that haven't been edited yet.
 
-3. Edit this file.
+In the menu "Tools → Automatic translations", select "Automatic translation mode → Add as needing edit", "Search filter → Not translated strings" and "Machine translations → Google Translate"
 
-4. **PLEASE** make sure that you are using UNIX style line ending and UTF-8 encoding.
+After letting it run for a while, say 20 minutes, it should have finished and added a halfway decent translation for your language.
 
-##### To update the language you are working on:
+Now you can continue with translating by pressing a fitting item in the "String Status".
 
-1. To update your translated .po file from the template you have two choices:
 
-    * Go to the directory of the translation and run:
+### Automatic Suggestions
 
-    `msgmerge -U nicotine.po ../../nicotine.pot`
+Whilst translating in normal mode, you can select "Automatic Suggestions," this is great to see the proposed translations from various translation services. Google Translate works very well, but you might find other translations that are more to the point.
 
-    * Or if using poedit use `Catalog -> Update from POT file` menu.
 
-2. Edit your translation.
+### Zen Mode
 
-3. **PLEASE** make sure that you are using UNIX style line ending and UTF-8 encoding.
+In Zen mode you can check and improve all items you have selected.
 
-### How to test translations
 
-When finished editing the .po file you must compile the language file to a .mo file.
+### Search and Replace
 
-You can do this either by:
+Using consistent terms for the same things makes the translation easier to understand. You may also find that some words are mistranslated by the engines, for example "shares" is often translated as "shares from the stockmarket" and not as in "sharing files and directories".
 
-* Running `msgfmt nicotine.po -o nicotine.mo` from the command line.
+You can use the "Search and Replace" tool to help you with that.
 
-* Using poedit `File -> Compile to MO` menu.
+### _Underscores in the strings
+In case you are wondering what to do with the underscores, the Alt-shortcuts (called mnemonics in GTK) provide quick access to a visible UI element (button, menu item etc). If you open any menu and hold down the Alt-key you will see some letters will get an underline. Pressing Alt and the underlined key is the same as pressing that menu item with the mouse.
 
-When restarting Nicotine+ you should see the fruit of your labor :)
+So you can translate "_Quit" to "_Cerrar". If in the same menu the "C" is already in use, simply put the underscore in front of another letter. Of course the "C" is the most prominent letter in the word, so use "_C" if possible.
 
----
+Our first priority is to get all strings translated.
+Please use an underscore in the translated string, if the original string also has one. Just pick the letter that strikes you as most suitable.
+Getting the right underscore next to the right letter is something that's easier to do if you see nicotine+ running with the updated translation strings.
 
-# Developers
 
-##### To update the .pot file (template):
+## Suggesting improvements to the original English
+We love suggestions! If a string in the original English version seems odd or can be improved, please create an issue, and we will think about it and discuss it.
 
-* Run the `tr_gen.py` script from the `languages` directory.
+If you simply edit a string to your liking, we may never notice and then a good idea is lost, or you may create confusion because of a problem you have never thought about.
 
-##### To update all languages .po files:
+So please, translate all strings as literal as possible, and discuss your thoughts in an issue.
 
-* Run the `mergeall` script from the `languages` directory.
 
-* Then, each `nicotine.po` will need to be updated by translators.
+## Conflicts with other translators
 
-##### To compile all languages .po files:
+If you notice another translator is undoing your translations, please don't revert it back, but add a comment to the string, and discuss with the other translator about the best translation.
 
-* Run the `msgfmtall.py` script from the `languages` directory.
 
----
+## Testing Updated Translations
 
-# More on translation
+After translating, you can test your translation by running Nicotine+ with the new translations.
 
-Nicotine+ will try to autodetect your language based on what locale you're using.
+Nicotine+ will first try to find your translation files in your project folder, which is particularly useful for testing translations from the git source tree or if your are using the Python virtualenv framework.
 
-For testing purposes Nicotine+ can be forced to use a specific language.
+In order to use the updated translations when running Nicotine+ from your project folder, you need to generate `.mo` files by running:
 
-You can do it either by:
+```console
+python3 setup.py build
+```
 
-* Setting the language via the GUI `Preferences -> Language`.
+The newly generated files will end up in the `mo/` folder.
 
-* Setting your locale before starting Nicotine+ ex:
+If Nicotine+ doesn't find the `.mo` files in your project folder, it will fall back to searching in your system locale path, which is OS specific. A GNU/Linux distribution package will install the files in the system locale path.
 
-    * English: `LC_ALL=en_US.UTF-8 python nicotine`
-    * French: `LC_ALL=fr_FR.UTF-8 python nicotine`
-    * ...
 
-Nicotine+ will first try to find your translation files in your project directory.
-It's particularly useful for testing translations from the git source tree or if your are using python virtualenv framework.
+## Testing Different Languages
 
-Your translation file should be located in:
-`$(your_git_clone_path)/languages/$(lang)/LC_MESSAGES/nicotine.{mo,po}`.
+Nicotine+ will try to autodetect your language based on what locale you are using. For testing purposes Nicotine+ can be forced to use another language. You can do this by specifying a locale before starting Nicotine+, e.g.:
 
-If Nicotine+ don't find the translation files in your project directory it will fall back to searching in your system locale path which is OS specific. A GNU/Linux distribution package will put them in the system locale path.
+* English: `LANGUAGE=en_US.UTF-8 python3 nicotine`
+* French: `LANGUAGE=fr_FR.UTF-8 python3 nicotine`
+* ...
 
-* On GNU/Linux: `/usr/share/locale/$(lang)/LC_MESSAGES/nicotine.{mo,po}`.
 
-* On Windows: `%PYTHONHOME%\share\locale\$(lang)\LC_MESSAGES`.
+## Adding Yourself to Translators
+
+If you want you can add yourself to [TRANSLATORS.md](https://github.com/nicotine-plus/nicotine-plus/blob/master/TRANSLATORS.md) and the credits list in Help → About: [pynicotine/gtkgui/dialogs/about.py](https://github.com/nicotine-plus/nicotine-plus/blob/master/pynicotine/gtkgui/dialogs/about.py). Add yourself to the top of matching section and then create a PR (pull request).
+
+
+## Updating Translation Template
+
+This part is relevant for developers.
+
+The translation template file `po/nicotine.pot` should be updated after modifying strings in the codebase. To update the template, run the following command:
+
+```console
+python3 po/update_pot.py
+```

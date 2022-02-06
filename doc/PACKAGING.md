@@ -1,52 +1,86 @@
 # Packaging
 
-### GNU/Linux instructions
+## Note for packagers
+This is a special note for distribution packagers: There is a standard feature of GitHub which enables you to be notified of new package releases: In the top right bar there is the *Watch* option, which has the suboption to be notified of *releases only*. Please subscribe so you won't miss any of our new releases.
+Thanks!
 
-##### Building a source distribution
+## Dependencies
+Dependencies for Nicotine+ are described in [DEPENDENCIES.md](DEPENDENCIES.md).
 
-To build source distribution files (.tar.bz2 & .tar.gz) from the git repository run:
+## GNU/Linux Instructions
 
-`python setup.py sdist --formats=bztar,gztar`
+### Building a Source Distribution
 
-The source distribution files will be located in the `dist` subdirectory of your git repository.
+To build source distribution files `.tar.bz2` and `.tar.gz` from the Git repository, run:
 
-##### Building a RPM package
+```console
+python3 setup.py sdist --formats=bztar,gztar
+```
 
-You need to install the RPM building tools first:
+The source distribution files will be located in the `dist/` subfolder.
 
-* On Redhat/Fedora based distributions: `sudo dnf install rpm-build`
+### Building a Debian Package
 
-* On Debian/Ubuntu based distributions: `sudo apt-get install rpm`
+Unstable and stable PPAs are already provided for pre-compiled packages. However, if you wish to build your own package, perform the following steps.
 
-Then you can create an RPM with:
+Start by installing the build dependencies:
 
-`python setup.py bdist_rpm`
+```console
+sudo apt build-dep .
+```
 
-The RPM package will be located in the `dist` subdirectory of your git repository.
+Generate the "upstream" tarball:
+
+```console
+python3 setup.py sdist
+mk-origtargz dist/nicotine-plus-*.tar.gz
+```
+
+Build the Debian package:
+
+```console
+debuild -sa -us -uc
+```
 
 
-### Windows
+## Windows
 
-##### Building a frozen application via PyInstaller
+GitHub Actions currently builds Nicotine+ installers for Windows. However, the following instructions may be useful if you wish to generate an installer on your own machine.
 
-First you need to install PyInstaller via pip:
+### Building a Frozen Application with cx_Freeze
 
-`python.exe -m pip install PyInstaller`
+Follow the instructions on installing MSYS2: [https://pygobject.readthedocs.io/en/latest/getting_started.html#windows-logo-windows](https://pygobject.readthedocs.io/en/latest/getting_started.html#windows-logo-windows)
 
-Once PyInstaller is installed go to the git root folder and run via cmd.exe or Powershell:
+Clone the `nicotine-plus` Git repository:
 
-`C:\Python27\Scripts\pyinstaller.exe .\tools\nicotine+-win32.spec`
+```console
+pacman -S git
+git clone https://github.com/nicotine-plus/nicotine-plus
+cd nicotine-plus
+```
 
-When the frozen application finish to build you will find it under the `dist\Nicotine+` subdirectory.
+Install dependencies:
 
-If you want to run the frozen application you can launch the executable `dist\Nicotine+\Nicotine+.exe`.
+```console
+export NICOTINE_GTK_VERSION=3
+export ARCH=x86_64
+pacman --noconfirm -S --needed mingw-w64-$ARCH-python
+python3 packaging/windows/dependencies_core.py
+python3 packaging/windows/dependencies_packaging.py
+```
 
-##### Building a NSIS installer from the frozen application
+Build the application:
 
-After building the frozen app download the last zip from [NSIS2 version](https://sourceforge.net/projects/nsis/files/NSIS%202/).
+```console
+python3 packaging/windows/setup.py bdist_msi
+```
 
-Extract it in the `tools\win32-installer` directory.
+When the application has finished building, it is located in the `build\exe.*\` subfolder. The installer is located in the `dist\` subfolder.
 
-Then via cmd.exe or Powershell go to `tools\win32-installer` directory and run `nsis-$(version)/makensis.exe nicotine+.nsi`
+If you want to run the application, you can launch the executable `build\exe.*\Nicotine+.exe`.
 
-You should now find a `Nicotine+-$(version).exe` installer in the `tools\win32-installer` directory.
+### Building a 32-bit (i686) Application and Installer
+
+Start a MinGW 32-bit terminal, and follow the above instructions again. Replace any instance of `x86_64` with `i686` when installing packages.
+
+You are recommended to clone a fresh copy of the `nicotine-plus` Git repository before building a frozen application again.

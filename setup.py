@@ -1,6 +1,5 @@
-#!/usr/bin/env python2
-# -*- coding: utf-8 -*-
-#
+#!/usr/bin/env python3
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
 # COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
 # COPYRIGHT (C) 2009-2010 Quinox <quinox@users.sf.net>
 # COPYRIGHT (C) 2009 Hedonist <ak@sensi.org>
@@ -24,120 +23,72 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 """
-    To install Nicotine+ on a GNU/Linux distribution run:
-    sudo python setup.py install
+    To install Nicotine+ on a GNU/Linux distribution, run:
+    pip3 install .
 """
 
-import sys
-import os
 import glob
 
-from os.path import isdir
-from distutils.core import setup
+from pkgutil import walk_packages
+from setuptools import setup
+from setuptools.command.build_py import build_py
 
-# Compute data_files
-files = []
+import pynicotine
 
-# Manuals
-manpages = glob.glob(os.path.join("manpages", "*.1"))
+from pynicotine.config import config
+from pynicotine.i18n import build_translations
+from pynicotine.i18n import get_translation_paths
 
-for man in manpages:
-    files.append(
-        (
-            os.path.join(sys.prefix, "share/man/man1"),
-            [man]
-        )
-    )
 
-# Icons with fixed size
-for sizeicons in ["16x16", "32x32", "48x48", "64x64", "96x96"]:
-    files.append(
-        (
-            os.path.join(sys.prefix, "share/icons/hicolor", sizeicons, "apps"),
-            ["files/icons/" + sizeicons + "/nicotine-plus.png"]
-        )
-    )
+class BuildPyCommand(build_py):
 
-# Scalable icons
-files.append(
-    (
-        os.path.join(sys.prefix, "share/icons/hicolor/scalable/apps"),
-        ["files/icons/scalable/nicotine-plus.svg"]
-    )
-)
-
-# Desktop file
-files.append(
-    (
-        os.path.join(sys.prefix, "share/applications"),
-        ["files/nicotine.desktop"]
-    )
-)
-
-# Translation files
-mo_dirs = [x for x in glob.glob(os.path.join("languages", "*")) if isdir(x)]
-
-for mo in mo_dirs:
-
-    p, lang = os.path.split(mo)
-    lc_messages_path = os.path.join(mo, "LC_MESSAGES")
-
-    if lang in ("msgfmtall.py", "tr_gen.py", "mergeall", "nicotine.pot"):
-        continue
-
-    files.append(
-        (
-            os.path.join(sys.prefix, "share/locale", lang, "LC_MESSAGES"),
-            [os.path.join(lc_messages_path, "nicotine.mo")]
-        )
-    )
-
-# Sounds
-sound_dirs = glob.glob(os.path.join("sounds", "*"))
-
-for sounds in sound_dirs:
-    p, theme = os.path.split(sounds)
-    for file in ["private.ogg", "room_nick.ogg", "details.txt", "license.txt"]:
-        files.append(
-            (
-                os.path.join(sys.prefix, "share/nicotine/sounds", theme),
-                [os.path.join(sounds, file)]
-            )
-        )
-
-# Documentation
-for (path, dirs, docfiles) in os.walk("doc"):
-
-    dst_path = os.sep.join(path.split("/")[1:])
-
-    for f in docfiles:
-        files.append(
-            (
-                os.path.join(sys.prefix, "share/doc/nicotine", dst_path),
-                [os.path.join(path, f)]
-            )
-        )
+    def run(self):
+        build_translations()
+        build_py.run(self)
 
 
 if __name__ == '__main__':
 
-    from pynicotine.utils import version
-    LONG_DESCRIPTION = """Nicotine+ is a client for the SoulSeek filesharing network, forked from Nicotine."""
+    # Specify a description for the PyPi project page
+    LONG_DESCRIPTION = """Nicotine+ is a graphical client for the Soulseek peer-to-peer
+network.
 
+Nicotine+ aims to be a pleasant, free and open source (FOSS)
+alternative to the official Soulseek client, providing additional
+functionality while keeping current with the Soulseek protocol."""
+
+    # Specify included files
+    PACKAGES = ["pynicotine"] + \
+        [name for importer, name, ispkg in walk_packages(path=pynicotine.__path__, prefix="pynicotine.") if ispkg]
+
+    PACKAGE_DATA = {package: ["*.bin", "*.md", "*.py", "*.svg", "*.ui", "PLUGININFO"] for package in PACKAGES}
+
+    DATA_FILES = [
+        ("share/applications", glob.glob("data/*.desktop")),
+        ("share/metainfo", glob.glob("data/*.metainfo.xml")),
+        ("share/icons/hicolor/scalable/apps", glob.glob("pynicotine/gtkgui/icons/hicolor/scalable/apps/*.svg")),
+        ("share/icons/hicolor/scalable/intl", glob.glob("pynicotine/gtkgui/icons/hicolor/scalable/intl/*.svg")),
+        ("share/icons/hicolor/symbolic/apps", glob.glob("pynicotine/gtkgui/icons/hicolor/symbolic/apps/*.svg")),
+        ("share/doc/nicotine", glob.glob("[!404.md]*.md") + glob.glob("doc/*.md")),
+        ("share/man/man1", glob.glob("data/*.1"))
+    ] + get_translation_paths()
+
+    # Run setup
     setup(
-        name="nicotine",
-        version=version,
-        license="GPLv3",
-        description="Nicotine+, a client for the SoulSeek filesharing network.",
-        author="Michael Labouebe",
-        author_email="gfarmerfr@free.fr",
-        url="https://www.nicotine-plus.org/",
-        packages=['pynicotine', 'pynicotine.gtkgui', 'pynicotine.gtkgui.ui'],
-        package_dir={'pynicotine.gtkgui': 'pynicotine/gtkgui'},
-        package_data={
-            'pynicotine.gtkgui.ui': ["*.ui"]
-        },
-        scripts=['nicotine'],
+        name="nicotine-plus",
+        version=config.version,
+        license="GPLv3+",
+        description="Graphical client for the Soulseek peer-to-peer network",
         long_description=LONG_DESCRIPTION,
-        data_files=files
+        author="Nicotine+ Team",
+        author_email="nicotine-team@lists.launchpad.net",
+        url=config.website_url,
+        platforms="any",
+        packages=PACKAGES,
+        package_data=PACKAGE_DATA,
+        scripts=["nicotine"],
+        data_files=DATA_FILES,
+        python_requires=">=3.5",
+        install_requires=["PyGObject>=3.18"],
+        cmdclass={"build_py": BuildPyCommand}
     )

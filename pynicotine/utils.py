@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
-#
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
+# COPYRIGHT (C) 2020 Lene Preuss <lene.preuss@gmail.com>
 # COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
 # COPYRIGHT (C) 2007 Daelstorm <daelstorm@gmail.com>
 # COPYRIGHT (C) 2003-2004 Hyriand <hyriand@thegraveyard.org>
@@ -25,236 +25,421 @@
 This module contains utility functions.
 """
 
-from __future__ import division
-
-import string
-from UserDict import UserDict
-from subprocess import Popen, PIPE
+import errno
+import json
 import os
-import dircache
+import pickle
 import sys
-import gobject
-import locale
-import gettext
+import webbrowser
 
-from logfacility import log as logfacility
+from pynicotine.config import config
+from pynicotine.logfacility import log
 
-version = "1.4.2"
-
-log = 0
-win32 = sys.platform.startswith("win")
-
-illegalpathchars = []
-if win32:
-    illegalpathchars += ["?", ":", ">", "<", "|", "*", '"']
-
-illegafilechars = illegalpathchars + ["\\", "/"]
-replacementchar = '_'
+FILE_SIZE_SUFFIXES = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB']
+PUNCTUATION = ['!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>',
+               '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~', '–', '—', '‐', '’', '“', '”', '…']
+ILLEGALPATHCHARS = ['?', ':', '>', '<', '|', '*', '"']
+ILLEGALFILECHARS = ILLEGALPATHCHARS + ['\\', '/']
+REPLACEMENTCHAR = '_'
+OPEN_SOULSEEK_URL = None
 
 
-def CleanFile(filename):
+def rename_process(new_name, debug_info=False):
 
-    for char in illegafilechars:
-        filename = filename.replace(char, replacementchar)
+    errors = []
+
+    # Renaming ourselves for pkill et al.
+    try:
+        import ctypes
+        # GNU/Linux style
+        libc = ctypes.CDLL(None)
+        libc.prctl(15, new_name, 0, 0, 0)
+
+    except Exception as error:
+        errors.append(error)
+        errors.append("Failed GNU/Linux style")
+
+        try:
+            import ctypes
+            # BSD style
+            libc = ctypes.CDLL(None)
+            libc.setproctitle(new_name)
+
+        except Exception as error:
+            errors.append(error)
+            errors.append("Failed BSD style")
+
+    if debug_info and errors:
+        msg = ["Errors occurred while trying to change process name:"]
+        for i in errors:
+            msg.append("%s" % (i,))
+        log.add('\n'.join(msg))
+
+
+def clean_file(filename):
+
+    for char in ILLEGALFILECHARS:
+        filename = filename.replace(char, REPLACEMENTCHAR)
 
     return filename
 
 
-def CleanPath(path, absolute=False):
+def clean_path(path, absolute=False):
 
-    if win32:
+    # Without hacks it is (up to Vista) not possible to have more
+    # than 26 drives mounted, so we can assume a '[a-zA-Z]:\' prefix
+    # for drives - we shouldn't escape that
+    drive = ''
+    if absolute and path[1:3] == ':\\' and path[0:1] and path[0].isalpha():
+        drive = path[:3]
+        path = path[3:]
 
-        # Without hacks it is (up to Vista) not possible to have more
-        # than 26 drives mounted, so we can assume a '[a-zA-Z]:\' prefix
-        # for drives - we shouldn't escape that
-        drive = ''
-        if absolute and path[1:3] == ':\\' and path[0:1] and path[0].isalpha():
-            drive = path[:3]
-            path = path[3:]
+    for char in ILLEGALPATHCHARS:
+        path = path.replace(char, REPLACEMENTCHAR)
 
-        for char in illegalpathchars:
-            path = path.replace(char, replacementchar)
+    path = ''.join([drive, path])
 
-        path = ''.join([drive, path])
-
-        # Path can never end with a period on Windows machines
-        path = path.rstrip('.')
+    # Path can never end with a period or space on Windows machines
+    path = path.rstrip('. ')
 
     return path
 
 
-def ApplyTranslation():
-    """Function dealing with translations and locales.
+def get_path(folder_name, base_name, callback, data=None):
+    """ Call a specified function, supplying an optimal file path depending on
+    which path characters the target file system supports """
 
-    We try to autodetect the language and fix the locale.
+    try:
+        filepath = os.path.join(folder_name, base_name)
+        callback(filepath, data)
 
-    If something goes wrong we fall back to no translation.
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            # The issue is not caused by invalid path characters, raise error as usual
+            raise OSError from error
 
-    This function also try to find translation files in the project path first:
-    $(PROJECT_PATH)/languages/$(LANG)/LC_MESSAGES/nicotine.mo
+        # Use path with forbidden characters removed (NTFS/FAT)
+        filepath = os.path.join(folder_name, clean_file(base_name))
+        callback(filepath, data)
 
-    If no translations are found we fall back to the system path for locates:
-    GNU/Linux: /usr/share/locale/$(LANG)/LC_MESSAGES
-    Windows: %PYTHONHOME%\share\locale\$(LANG)\LC_MESSAGES
 
-    Note: To the best of my knowledge when we are in a python venv
-    falling back to the system path does not work."""
+def open_file_path(file_path, command=None):
+    """ Currently used to either open a folder or play an audio file
+    Tries to run a user-specified command first, and falls back to
+    the system default. """
 
-    # Package name for gettext
-    PACKAGE = 'nicotine'
+    try:
+        file_path = os.path.normpath(file_path)
 
-    # Local path where to find translation (mo) files
-    LOCAL_MO_PATH = 'languages'
+        if command and "$" in command:
+            execute_command(command, file_path)
 
-    # Python 2.7.X is build via Visual Studio 2008 on Windows:
-    # https://stackoverflow.com/questions/32037573/load-gtk-glade-translations-in-windows-using-python-pygobject
-    # https://docs.python.org/devguide/setup.html#windows
-    # The locales table for VS2008 can be found here:
-    # https://msdn.microsoft.com/en-us/library/cdax410z(v=vs.90).aspx
-    # https://msdn.microsoft.com/en-us/library/39cwe7zf(v=vs.90).aspx
-    def _build_localename_win(localetuple):
-        """ Builds a locale code from the given tuple (language code, encoding).
-            No aliasing or normalizing takes place."""
+        elif sys.platform == "win32":
+            os.startfile(file_path)
 
-        language, encoding = localetuple
+        elif sys.platform == "darwin":
+            execute_command("open $", file_path)
 
-        if language is None:
-            language = 'C'
+        elif not webbrowser.open(file_path):
+            raise webbrowser.Error("no known URL provider available")
 
-        if encoding is None:
-            return language
+    except Exception as error:
+        log.add(_("Failed to open file path: %s"), error)
+
+
+def open_uri(uri):
+    """ Open a URI in an external (web) browser. The given argument has
+    to be a properly formed URI including the scheme (fe. HTTP). """
+
+    # Situation 1, user defined a way of handling the protocol
+    protocol = uri[:uri.find(":")]
+    protocol_handlers = config.sections["urls"]["protocols"]
+
+    if protocol in protocol_handlers and protocol_handlers[protocol]:
+        try:
+            execute_command(protocol_handlers[protocol], uri)
+            return True
+
+        except RuntimeError as error:
+            log.add(error)
+
+    if protocol == "slsk":
+        OPEN_SOULSEEK_URL(uri.strip())  # pylint:disable=not-callable
+        return True
+
+    # Situation 2, user did not define a way of handling the protocol
+    try:
+        if not webbrowser.open(uri):
+            raise webbrowser.Error("no known URL provider available")
+
+        return True
+
+    except Exception as error:
+        log.add(_("Failed to open URL: %s"), error)
+
+    return False
+
+
+def open_log(folder, filename):
+    _handle_log(folder, filename, open_log_callback)
+
+
+def delete_log(folder, filename):
+    _handle_log(folder, filename, delete_log_callback)
+
+
+def _handle_log(folder, filename, callback):
+
+    try:
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+
+        filename = clean_file(filename) + ".log"
+        get_path(folder, filename, callback)
+
+    except Exception as error:
+        log.add("Failed to process log file: %s", error)
+
+
+def open_log_callback(path, _data):
+
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8"):
+            # No logs, create empty file
+            pass
+
+    open_file_path(path)
+
+
+def delete_log_callback(path, _data):
+
+    with open(path, "w", encoding="utf-8"):
+        # Check if path should contain special characters
+        pass
+
+    os.remove(path)
+
+
+def get_latest_version():
+
+    response = http_request(
+        "https", "pypi.org", "/pypi/nicotine-plus/json",
+        headers={"User-Agent": config.application_name}
+    )
+    data = json.loads(response)
+
+    hlatest = data['info']['version']
+    latest = int(make_version(hlatest))
+
+    try:
+        date = data['releases'][hlatest][0]['upload_time']
+    except Exception:
+        date = None
+
+    return hlatest, latest, date
+
+
+def make_version(version):
+
+    major, minor, patch = (int(i) for i in version.split(".")[:3])
+    stable = 1
+
+    if "dev" in version or "rc" in version:
+        # Example: 2.0.1.dev1
+        # A dev version will be one less than a stable version
+        stable = 0
+
+    return (major << 24) + (minor << 16) + (patch << 8) + stable
+
+
+def human_length(seconds):
+
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+
+    if days > 0:
+        ret = '%i:%02i:%02i:%02i' % (days, hours, minutes, seconds)
+    elif hours > 0:
+        ret = '%i:%02i:%02i' % (hours, minutes, seconds)
+    else:
+        ret = '%i:%02i' % (minutes, seconds)
+
+    return ret
+
+
+def get_result_bitrate_length(filesize, attributes):
+    """ Used to get the audio bitrate and length of search results and
+    user browse files """
+
+    h_bitrate = ""
+    h_length = ""
+
+    bitrate = 0
+    length = 0
+
+    # If there are 3 entries in the attribute list
+    if len(attributes) == 3:
+
+        first = attributes[0]
+        second = attributes[1]
+        third = attributes[2]
+
+        # Sometimes the vbr indicator is in third position
+        # Known clients: Soulseek NS, Nicotine+, Museek+, SoulSeeX
+        if third in (0, 1):
+
+            if third == 1:
+                h_bitrate = " (vbr)"
+
+            bitrate = first
+            h_bitrate = str(bitrate) + h_bitrate
+
+            length = second
+            h_length = human_length(second)
+
+        # Sometimes the vbr indicator is in second position
+        # Known clients: unknown (does this actually exist?)
+        elif second in (0, 1):
+
+            if second == 1:
+                h_bitrate = " (vbr)"
+
+            bitrate = first
+            h_bitrate = str(bitrate) + h_bitrate
+
+            length = third
+            h_length = human_length(third)
+
+        # Lossless audio, length is in first position
+        # Known clients: SoulseekQt 2015-6-12 and later
+        elif third > 1:
+
+            length = first
+            h_length = human_length(first)
+
+            # Bitrate = sample rate (Hz) * word length (bits) * channel count
+            # Bitrate = 44100 * 16 * 2
+            bitrate = (second * third * 2) // 1000
+            h_bitrate = str(bitrate)
+
         else:
-            return language + '.' + encoding
 
-    # Locales handling
-    if win32:
+            bitrate = first
+            h_bitrate = str(bitrate) + h_bitrate
 
-        # On windows python can get a normalize tuple (language code, encoding)
-        locale_win = locale.getdefaultlocale()
+    # If there are 2 entries in the attribute list
+    # Known clients: SoulseekQt
+    elif len(attributes) == 2:
 
-        # Build a locale name compatible with gettext
-        locale_win_gettext = _build_localename_win(locale_win)
+        first = attributes[0]
+        second = attributes[1]
 
-        # Fix environnement variables
-        os.environ['LC_ALL'] = locale_win_gettext
+        # Sometimes the vbr indicator is in second position
+        # Known clients: SoulseekQt 2015-2-21 and earlier
+        if second in (0, 1):
 
-    else:
-        # Unix locales handling: We let the system handle the locales
-        locale.setlocale(locale.LC_ALL, '')
+            # If it's a vbr file we can't deduce the length
+            if second == 1:
 
-    # Gettext handling
-    if gettext.find(PACKAGE, localedir=LOCAL_MO_PATH) is None:
+                h_bitrate = " (vbr)"
 
-        # Locales are not in the current dir
-        # We let gettext handle the situation: if if found them in the system dir
-        # the app will be trnaslated, if not it will be untranslated.
-        gettext.install(PACKAGE)
+                bitrate = first
+                h_bitrate = str(bitrate) + h_bitrate
 
-    else:
+            # If it's a constant bitrate we can deduce the length
+            else:
 
-        # Locales are in the current dir: install them
-        if win32:
+                bitrate = first
+                h_bitrate = str(bitrate) + h_bitrate
 
-            # On windows we use intl.dll: the core DLL of GNU gettext-runtime on Windows
-            import ctypes
+                if bitrate > 0:
+                    # Dividing the file size by the bitrate in Bytes should give us a good enough approximation
+                    length = filesize / (bitrate * 125)
+                    h_length = human_length(length)
 
-            libintl = ctypes.cdll.LoadLibrary("intl.dll")
+        # Lossless audio without length attribute
+        # Known clients: SoulseekQt 2015-6-12 and later
+        elif first >= 8000 and second <= 64:
 
-            libintl.bindtextdomain(PACKAGE, LOCAL_MO_PATH)
-            libintl.bind_textdomain_codeset(PACKAGE, "UTF-8")
+            # Bitrate = sample rate (Hz) * word length (bits) * channel count
+            # Bitrate = 44100 * 16 * 2
+            bitrate = (first * second * 2) // 1000
+            h_bitrate = str(bitrate)
 
+            if bitrate > 0:
+                # Dividing the file size by the bitrate in Bytes should give us a good enough approximation
+                length = filesize / (bitrate * 125)
+                h_length = human_length(length)
+
+        # Sometimes the bitrate is in first position and the length in second position
+        # Known clients: SoulseekQt 2015-6-12 and later
         else:
-            locale.bindtextdomain(PACKAGE, LOCAL_MO_PATH)
-            gettext.bindtextdomain(PACKAGE, LOCAL_MO_PATH)
 
-        tr = gettext.translation(PACKAGE, localedir=LOCAL_MO_PATH)
-        tr.install()
+            bitrate = first
+            h_bitrate = str(bitrate) + h_bitrate
 
+            length = second
+            h_length = human_length(second)
 
-def displayTraceback(exception=None):
+    # Ignore invalid values
+    if bitrate <= 0:
+        h_bitrate = ""
+        bitrate = 0
 
-    global log
-    import traceback
+    if length < 0:
+        h_length = ""
+        length = 0
 
-    if exception is None:
-        tb = traceback.format_tb(sys.exc_info()[2])
-    else:
-        tb = traceback.format_tb(exception)
-
-    if log:
-        log("Traceback: " + str(sys.exc_info()[0].__name__) + ": " + str(sys.exc_info()[1]))
-
-    for line in tb:
-        if type(line) is tuple:
-            xline = ""
-            for item in line:
-                xline += str(item) + " "
-            line = xline
-
-        line = line.strip("\n")
-        if log:
-            log(line)
-
-    traceback.print_exc()
+    return h_bitrate, bitrate, h_length, length
 
 
-# Dictionary that's sorted alphabetically
-# @param UserDict dictionary to be alphabetized
-class SortedDict(UserDict):
+def _human_speed_or_size(unit):
 
-    # Constructor
-    # @param self SortedDict
-    def __init__(self):
+    template = "%.3g %s"
+    try:
+        for suffix in FILE_SIZE_SUFFIXES:
+            if unit < 1024:
+                if unit > 999:
+                    template = "%.4g %s"
 
-        self.__keys__ = []
-        self.__sorted__ = True
-        UserDict.__init__(self)
+                return template % (unit, suffix)
 
-    # Set key
-    # @param self SortedDict
-    # @param key dict key
-    # @param value dict value
-    def __setitem__(self, key, value):
+            unit /= 1024
 
-        if not self.__dict__.has_key(key):
-            self.__keys__.append(key)
-            self.__sorted__ = False
+    except TypeError:
+        pass
 
-        UserDict.__setitem__(self, key, value)
-
-    # Delete key
-    # @param self SortedDict
-    # @param key dict key
-    def __delitem__(self, key):
-
-        self.__keys__.remove(key)
-        UserDict.__delitem__(self, key)
-
-    # Get keys
-    # @param self SortedDict
-    # @return __keys__
-    def keys(self):
-
-        if not self.__sorted__:
-            self.__keys__.sort()
-            self.__sorted__ = True
-
-        return self.__keys__
-
-    # Get items
-    # @param self SortedDict
-    # @return list of keys and items
-    def items(self):
-
-        if not self.__sorted__:
-            self.__keys__.sort()
-            self.__sorted__ = True
-
-        for key in self.__keys__:
-            yield key, self[key]
+    return unit
 
 
-def executeCommand(command, replacement=None, background=True, returnoutput=False, placeholder='$'):
+def human_speed(speed):
+    return _human_speed_or_size(speed) + "/s"
+
+
+def human_size(filesize):
+    return _human_speed_or_size(filesize)
+
+
+def humanize(number):
+    return "{:n}".format(number)
+
+
+def unescape(string):
+    """Removes quotes from the beginning and end of strings, and unescapes it."""
+
+    string = string.encode('latin-1', 'backslashreplace').decode('unicode-escape')
+
+    try:
+        if (string[0] == string[-1]) and string.startswith(("'", '"')):
+            return string[1:-1]
+    except IndexError:
+        pass
+
+    return string
+
+
+def execute_command(command, replacement=None, background=True, returnoutput=False, placeholder='$'):
     """Executes a string with commands, with partial support for bash-style quoting and pipes.
 
     The different parts of the command should be separated by spaces, a double
@@ -275,9 +460,12 @@ def executeCommand(command, replacement=None, background=True, returnoutput=Fals
     goes wrong while executing the command.
 
     Example commands:
-    * "C:\Program Files\WinAmp\WinAmp.exe" --xforce "--title=My Window Title"
+    * "C:\\Program Files\\WinAmp\\WinAmp.exe" --xforce "--title=My Window Title"
     * mplayer $
     * echo $ | flite -t """
+
+    from subprocess import PIPE
+    from subprocess import Popen
 
     # Example command: "C:\Program Files\WinAmp\WinAmp.exe" --xforce "--title=My Title" $ | flite -t
     if returnoutput:
@@ -288,7 +476,8 @@ def executeCommand(command, replacement=None, background=True, returnoutput=Fals
     if command.endswith("&"):
         command = command[:-1]
         if returnoutput:
-            print "Yikes, I was asked to return output but I'm also asked to launch the process in the background. returnoutput gets precedent."
+            log.add("Yikes, I was asked to return output but I'm also asked to launch "
+                    "the process in the background. returnoutput gets precedent.")
         else:
             background = True
 
@@ -322,7 +511,7 @@ def executeCommand(command, replacement=None, background=True, returnoutput=Fals
 
     # subcommands is now: [['C:\Program Files\WinAmp\WinAmp.exe', '--xforce', '--title=My Title', '$'], ['flite', '-t']]
     if replacement:
-        for i in xrange(0, len(subcommands)):
+        for i, _ in enumerate(subcommands):
             subcommands[i] = [x.replace(placeholder, replacement) for x in subcommands[i]]
 
     # Chaining commands...
@@ -342,8 +531,9 @@ def executeCommand(command, replacement=None, background=True, returnoutput=Fals
             procs.append(Popen(subcommands[-1], stdin=procs[-1].stdout, stdout=finalstdout))
         if not background and not returnoutput:
             procs[-1].wait()
-    except:
-        raise RuntimeError("Problem while executing command %s (%s of %s)" % (subcommands[len(procs)], len(procs)+1, len(subcommands)))
+    except Exception as error:
+        raise RuntimeError("Problem while executing command %s (%s of %s)" %
+                           (subcommands[len(procs)], len(procs) + 1, len(subcommands))) from error
 
     if not returnoutput:
         return True
@@ -351,38 +541,328 @@ def executeCommand(command, replacement=None, background=True, returnoutput=Fals
     return procs[-1].communicate()[0]
 
 
-def findBestEncoding(bytes, encodings, fallback=None):
-    """Tries to convert the bytes with the encodings, the first successful conversion is returned.
+def load_file(path, load_func, use_old_file=False):
 
-    If none match the fallback encoding will be used with the 'replace' argument. If no fallback is
-    given the first encoding from the list is used."""
+    try:
+        if use_old_file:
+            path = path + ".old"
 
-    if isinstance(bytes, unicode):
-        return bytes
+        elif os.path.isfile(path + ".old"):
+            if not os.path.isfile(path):
+                raise OSError("*.old file is present but main file is missing")
 
-    for encoding in encodings:
+            if os.path.getsize(path) == 0:
+                # Empty files should be considered broken/corrupted
+                raise OSError("*.old file is present but main file is empty")
+
+        return load_func(path)
+
+    except Exception as error:
+        log.add(_("Something went wrong while reading file %(filename)s: %(error)s"),
+                {"filename": path, "error": error})
+
+        if not use_old_file:
+            # Attempt to load data from .old file
+            log.add(_("Attempting to load backup of file %s"), path)
+            return load_file(path, load_func, use_old_file=True)
+
+    return None
+
+
+def write_file_and_backup(path, callback, protect=False):
+
+    # Back up old file to path.old
+    try:
+        if os.path.exists(path):
+            from shutil import copy2
+            copy2(path, path + ".old")
+
+            if protect:
+                os.chmod(path + ".old", 0o600)
+
+    except Exception as error:
+        log.add(_("Unable to back up file %(path)s: %(error)s"), {
+            "path": path,
+            "error": error
+        })
+
+    # Save new file
+    if protect:
+        oldumask = os.umask(0o077)
+
+    try:
+        with open(path, "w", encoding="utf-8") as file_handle:
+            callback(file_handle)
+
+    except Exception as error:
+        log.add(_("Unable to save file %(path)s: %(error)s"), {
+            "path": path,
+            "error": error
+        })
+
+        # Attempt to restore file
         try:
-            return unicode(bytes, encoding)
-        except (UnicodeDecodeError, LookupError) as e:
-            pass
+            if os.path.exists(path + ".old"):
+                os.rename(path + ".old", path)
 
-    # None were successful
-    if fallback:
-        return unicode(bytes, fallback, 'replace')
+        except Exception as error:
+            log.add(_("Unable to restore previous file %(path)s: %(error)s"), {
+                "path": path,
+                "error": error
+            })
+
+    if protect:
+        os.umask(oldumask)
+
+
+def http_request(url_scheme, base_url, path, request_type="GET", body="", headers=None, timeout=10, redirect_depth=0):
+
+    if headers is None:
+        headers = {}
+
+    import http.client
+
+    if redirect_depth > 15:
+        raise http.client.HTTPException("Redirected too many times, giving up")
+
+    if url_scheme == "https":
+        conn = http.client.HTTPSConnection(base_url, timeout=timeout)
     else:
-        return unicode(bytes, encodings[0], 'replace')
+        conn = http.client.HTTPConnection(base_url, timeout=timeout)
+
+    try:
+        conn.request(request_type, path, body=body, headers=headers)
+        response = conn.getresponse()
+        redirect = response.getheader('Location')
+
+        if redirect:
+            from urllib.parse import urlparse
+            parsed_url = urlparse(redirect)
+            redirect_depth += 1
+
+            return http_request(
+                parsed_url.scheme, parsed_url.netloc, parsed_url.path,
+                request_type, body, headers, timeout, redirect_depth
+            )
+
+        contents = response.read().decode("utf-8")
+
+    finally:
+        # Always close connection, even when errors occur
+        conn.close()
+
+    return contents
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    """
+    Don't allow code execution from pickles
+    """
+
+    def find_class(self, module, name):
+        # Forbid all globals
+        raise pickle.UnpicklingError("global '%s.%s' is forbidden" %
+                                     (module, name))
+
+
+""" Command Aliases """
+
+
+def add_alias(rest):
+
+    aliases = config.sections["server"]["command_aliases"]
+
+    if rest:
+        args = rest.split(" ", 1)
+
+        if len(args) == 2:
+            if args[0] in ("alias", "unalias"):
+                return "I will not alias that!\n"
+
+            aliases[args[0]] = args[1]
+
+        if args[0] in aliases:
+            return "Alias %s: %s\n" % (args[0], aliases[args[0]])
+
+        return _("No such alias (%s)") % rest + "\n"
+
+    msg = "\n" + _("Aliases:") + "\n"
+
+    for key, value in aliases.items():
+        msg = msg + "%s: %s\n" % (key, value)
+
+    return msg + "\n"
+
+
+def unalias(rest):
+
+    aliases = config.sections["server"]["command_aliases"]
+
+    if rest and rest in aliases:
+        action = aliases[rest]
+        del aliases[rest]
+
+        return _("Removed alias %(alias)s: %(action)s\n") % {'alias': rest, 'action': action}
+
+    return _("No such alias (%(alias)s)\n") % {'alias': rest}
+
+
+def is_alias(command):
+
+    if not command.startswith("/"):
+        return False
+
+    base_command = command[1:].split(" ")[0]
+
+    if base_command in config.sections["server"]["command_aliases"]:
+        return True
+
+    return False
+
+
+def get_alias(command):
+
+    def getpart(line):
+
+        if line[0] != "(":
+            return ""
+
+        i = 1
+        ret = ""
+        level = 0
+
+        while i < len(line):
+            if line[i] == "(":
+                level = level + 1
+
+            if line[i] == ")":
+                if level == 0:
+                    return ret
+
+                level = level - 1
+
+            ret = ret + line[i]
+            i = i + 1
+
+        return ""
+
+    try:
+        command = command[1:].split(" ")
+        alias = config.sections["server"]["command_aliases"][command[0]]
+        param_string_found = False
+        ret = ""
+        i = 0
+
+        while i < len(alias):
+            if alias[i:i + 2] == "$(":
+                arg = getpart(alias[i + 1:])
+
+                if not arg:
+                    ret = ret + "$"
+                    i = i + 1
+                    continue
+
+                i = i + len(arg) + 3
+                args = arg.split("=", 1)
+
+                if len(args) > 1:
+                    default = args[1]
+                else:
+                    default = ""
+
+                args = args[0].split(":")
+
+                if len(args) == 1:
+                    first = last = int(args[0])
+                else:
+                    if args[0]:
+                        first = int(args[0])
+                    else:
+                        first = 1
+
+                    if args[1]:
+                        last = int(args[1])
+                    else:
+                        last = len(command)
+
+                value = " ".join(command[first:last + 1])
+
+                if not value:
+                    value = default
+
+                ret = ret + value
+                param_string_found = True
+
+            else:
+                ret = ret + alias[i]
+                i = i + 1
+
+                if not param_string_found and i == len(alias) and alias.startswith("/"):
+                    # Reached the end of alias contents, append potential arguments passed to the command
+                    args = " ".join(command[1:])
+
+                    if args:
+                        ret = ret + " " + args
+
+        return ret
+
+    except Exception as error:
+        log.add("%s", error)
+
+    return ""
+
+
+""" Chat Completion """
+
+
+def get_completion_list(commands, rooms):
+
+    config_words = config.sections["words"]
+
+    if not config_words["tab"]:
+        return []
+
+    completion_list = [config.sections["server"]["login"], "nicotine"]
+
+    if config_words["roomnames"]:
+        completion_list += rooms
+
+    if config_words["buddies"]:
+        for i in config.sections["server"]["userlist"]:
+            if i and isinstance(i, list):
+                user = str(i[0])
+                completion_list.append(user)
+
+    if config_words["aliases"]:
+        for k in config.sections["server"]["command_aliases"].keys():
+            completion_list.append("/" + str(k))
+
+    if config_words["commands"]:
+        completion_list += commands
+
+    return completion_list
+
+
+""" Debugging """
+
+
+def debug(*args):
+    """ Prints debugging info. """
+
+    truncated_args = [arg[:200] if isinstance(arg, str) else arg for arg in args]
+    log.add('*' * 8, truncated_args)
 
 
 def strace(function):
-    """Decorator for debugging"""
+    """ Decorator for debugging """
 
     from itertools import chain
 
     def newfunc(*args, **kwargs):
         name = function.__name__
-        print("%s(%s)" % (name, ", ".join(map(repr, chain(args, kwargs.values())))))
+        log.add("%s(%s)" % (name, ", ".join(map(repr, chain(args, list(kwargs.values()))))))
         retvalue = function(*args, **kwargs)
-        print("%s(%s): %s" % (name, ", ".join(map(repr, chain(args, kwargs.values()))), repr(retvalue)))
+        log.add("%s(%s): %s" % (name, ", ".join(map(repr, chain(args, list(kwargs.values())))), repr(retvalue)))
         return retvalue
 
     return newfunc

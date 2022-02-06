@@ -1,130 +1,62 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
-  <requires lib="gtk+" version="2.24"/>
-  <!-- interface-naming-policy project-wide -->
-  <object class="GtkWindow" id="TempWindow">
-    <property name="can_focus">False</property>
+  <requires lib="gtk+" version="3.0"/>
+  <object class="GtkBox" id="Main">
+    <property name="visible">True</property>
+    <property name="orientation">vertical</property>
+    <property name="hexpand">True</property>
     <child>
-      <object class="GtkVBox" id="userlistvbox">
+      <object class="GtkBox" id="BuddiesToolbar">
         <property name="visible">True</property>
-        <property name="can_focus">False</property>
-        <property name="spacing">3</property>
+        <property name="margin-start">6</property>
+        <property name="margin-end">6</property>
+        <property name="margin-top">6</property>
+        <property name="margin-bottom">6</property>
+        <property name="spacing">6</property>
         <child>
-          <object class="GtkLabel" id="BuddiesLabel">
+          <object class="GtkLabel">
             <property name="visible">True</property>
-            <property name="can_focus">False</property>
-            <property name="label" translatable="yes">Buddy List</property>
-            <property name="use_markup">True</property>
+            <property name="label" translatable="yes">Buddies</property>
+            <property name="margin-start">6</property>
+            <property name="margin-end">12</property>
+            <attributes>
+              <attribute name="weight" value="bold"/>
+            </attributes>
           </object>
-          <packing>
-            <property name="expand">False</property>
-            <property name="fill">True</property>
-            <property name="position">0</property>
-          </packing>
         </child>
         <child>
-          <object class="GtkScrolledWindow" id="userlistSW">
+          <object class="GtkEntry" id="AddUserEntry">
             <property name="visible">True</property>
-            <property name="can_focus">True</property>
-            <property name="hscrollbar_policy">automatic</property>
-            <property name="vscrollbar_policy">automatic</property>
-            <property name="shadow_type">in</property>
-            <child>
-              <object class="GtkTreeView" id="UserList">
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="has_tooltip">True</property>
-                <signal name="query-tooltip" handler="OnTooltip" swapped="no"/>
-              </object>
-            </child>
+            <property name="hexpand">True</property>
+            <property name="height-request">0</property>
+            <property name="width-chars">15</property>
+            <property name="placeholder-text" translatable="yes">Add buddy…</property>
+            <property name="tooltip-text" translatable="yes">Enter the username of the person you want to add to your buddy list</property>
+            <property name="primary-icon-name">avatar-default-symbolic</property>
+            <signal name="activate" handler="on_add_user"/>
+            <signal name="icon-press" handler="on_add_user"/>
           </object>
-          <packing>
-            <property name="expand">True</property>
-            <property name="fill">True</property>
-            <property name="position">1</property>
-          </packing>
         </child>
+      </object>
+    </child>
+    <child>
+      <object class="GtkBox">
+        <property name="visible">True</property>
         <child>
-          <object class="GtkHBox" id="UserHbox">
+          <object class="GtkScrolledWindow">
             <property name="visible">True</property>
-            <property name="can_focus">False</property>
+            <property name="vexpand">True</property>
             <child>
-              <object class="GtkLabel" id="label1">
+              <object class="GtkTreeView" id="UserListTree">
                 <property name="visible">True</property>
-                <property name="can_focus">False</property>
-                <property name="label" translatable="yes">Add Buddy: </property>
+                <property name="hexpand">True</property>
+                <property name="has-tooltip">True</property>
+                <property name="search-column">2</property>
+                <signal name="query-tooltip" handler="on_tooltip"/>
+                <signal name="row-activated" handler="on_row_activated"/>
               </object>
-              <packing>
-                <property name="expand">False</property>
-                <property name="fill">False</property>
-                <property name="position">0</property>
-              </packing>
-            </child>
-            <child>
-              <object class="GtkEntry" id="AddUserEntry">
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="invisible_char">•</property>
-                <property name="primary_icon_activatable">False</property>
-                <property name="secondary_icon_activatable">False</property>
-                <property name="primary_icon_sensitive">True</property>
-                <property name="secondary_icon_sensitive">True</property>
-                <signal name="activate" handler="OnAddUser" swapped="no"/>
-              </object>
-              <packing>
-                <property name="expand">True</property>
-                <property name="fill">True</property>
-                <property name="position">1</property>
-              </packing>
-            </child>
-            <child>
-              <object class="GtkButton" id="MoveList">
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <signal name="clicked" handler="OnMoveList" swapped="no"/>
-                <child>
-                  <object class="GtkImage" id="image1">
-                    <property name="visible">True</property>
-                    <property name="can_focus">False</property>
-                    <property name="stock">gtk-jump-to</property>
-                  </object>
-                </child>
-              </object>
-              <packing>
-                <property name="expand">False</property>
-                <property name="fill">False</property>
-                <property name="position">2</property>
-              </packing>
-            </child>
-            <child>
-              <object class="GtkButton" id="configureUsers">
-                <property name="visible">True</property>
-                <property name="can_focus">True</property>
-                <property name="receives_default">True</property>
-                <property name="tooltip_text" translatable="yes">Configure banned users</property>
-                <signal name="clicked" handler="OnSettingsBanIgnore" swapped="no"/>
-                <child>
-                  <object class="GtkImage" id="image2">
-                    <property name="visible">True</property>
-                    <property name="can_focus">False</property>
-                    <property name="stock">gtk-preferences</property>
-                    <property name="icon-size">1</property>
-                  </object>
-                </child>
-              </object>
-              <packing>
-                <property name="expand">False</property>
-                <property name="fill">False</property>
-                <property name="position">3</property>
-              </packing>
             </child>
           </object>
-          <packing>
-            <property name="expand">False</property>
-            <property name="fill">True</property>
-            <property name="position">2</property>
-          </packing>
         </child>
       </object>
     </child>

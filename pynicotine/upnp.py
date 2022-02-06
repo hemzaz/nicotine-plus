@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
-#
-# COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
-# COPYRIGHT (C) 2009-2010 Quinox <quinox@users.sf.net>
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
 #
 # GNU GENERAL PUBLIC LICENSE
 #    Version 3, 29 June 2007
@@ -19,448 +16,428 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from pynicotine import slskmessages
-from logfacility import log
-from utils import findBestEncoding
-
-import platform
-import re
-import subprocess
+import threading
+import time
+import select
 import socket
-from subprocess import Popen, PIPE, STDOUT
+
+from pynicotine.logfacility import log
+from pynicotine.utils import http_request
 
 
-class UPnPPortMapping:
-    """Class that handle UPnP Port Mapping"""
+class Router:
+    def __init__(self, wan_ip_type, url_scheme, base_url, root_url, service_type, control_url):
+        self.search_target = wan_ip_type
+        self.url_scheme = url_scheme
+        self.base_url = base_url
+        self.root_url = root_url
+        self.service_type = service_type
+        self.control_url = control_url
 
-    def __init__(self):
-        """Initialize the UPnP Port Mapping object."""
 
-        # Default discovery delay (ms)
-        self.discoverdelay = 2000
+class SSDPResponse:
+    """ Simple Service Discovery Protocol (SSDP) response """
 
-        # Default requested external WAN port
-        self.externalwanport = 15000
+    def __init__(self, message):
 
-        # List of existing port mappings
-        self.existingportsmappings = []
+        import email.parser
 
-        # Initial value that determine if a port mapping already exist to the
-        # client
-        self.foundexistingmapping = False
+        self.message = message
+        self.headers = list(email.parser.Parser().parsestr('\r\n'.join(message.splitlines()[1:])).items())
 
-        # Detect if we're on Windpws
-        self.iswin32 = platform.system().startswith("Win")
+    def __bytes__(self):
+        """ Return complete SSDP response """
 
-        # Defining where the miniupnpc binary might be
-        if self.iswin32:
-            # On windows we use a static build of upnpc
-            # That needs to be put in the upnpc subfolder
-            self.upnpcbinary = 'files\\win32\\upnpc\\upnpc-static.exe'
-        else:
-            # On GNU/linux we try to find it in the $PATH
-            self.upnpcbinary = 'upnpc'
+        return self.message.encode('utf-8')
 
-    def run_binary(self, cmd):
-        """Function used to call the upnpc binary.
 
-        Redirect stderr to stdout since we don't really care having
-        two distinct streams.
+class SSDPRequest:
+    """ Simple Service Discovery Protocol (SSDP) request """
 
-        Also prevent the command prompt from being shown on Windows.
-        """
+    def __init__(self, search_target):
 
-        if self.iswin32:
-            # Ugly hack to hide the command prompt on Windows
-            info = subprocess.STARTUPINFO()
-            info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        self.headers = {
+            "HOST": "%s:%s" % (SSDP.multicast_host, SSDP.multicast_port),
+            "ST": search_target,
+            "MAN": '"ssdp:discover"',
+            "MX": str(SSDP.response_time_secs)
+        }
 
-            p = Popen(cmd, stdout=PIPE, stderr=STDOUT, startupinfo=info)
-        else:
-            p = Popen(cmd, stdout=PIPE, stderr=STDOUT)
+    def sendto(self, sock, addr):
 
-        (out, err) = p.communicate()
+        msg = bytes(self)
+        sock.sendto(msg, addr)
 
-        return out.rstrip()
+        log.add_debug("UPnP: SSDP request: %s", msg)
 
-    def IsPossible(self):
-        """Function to check the requirements for doing a port mapping.
+    def __bytes__(self):
 
-        It tries to import the MiniUPnPc python binding: miniupnpc.
-        If it fails, it tries to use the MiniUPnPc binary: upnpc.
-        If neither of them are available UPnP Port Mapping is unavailable.
-        """
+        headers = ["M-SEARCH * HTTP/1.1"]
+
+        for header in self.headers.items():
+            headers.append("%s: %s" % header)
+
+        return '\r\n'.join(headers).encode('utf-8') + b'\r\n\r\n'
+
+
+class SSDP:
+    multicast_host = "239.255.255.250"
+    multicast_port = 1900
+    response_time_secs = 2
+
+    @staticmethod
+    def get_router_control_url(url_scheme, base_url, root_url):
 
         try:
-            # First we try to import the python binding
-            import miniupnpc
-        except ImportError as e1:
-            try:
-                # We fail to import the python module: fallback to the binary.
-                self.run_binary([self.upnpcbinary])
-            except Exception as e2:
-                # Nothing works :/
-                errors = [
-                    _('Failed to import miniupnpc module: %(error)s') %
-                    {'error': str(e1)},
-                    _('Failed to run upnpc binary: %(error)s') %
-                    {
-                        'error': findBestEncoding(
-                            str(e2),
-                            ['utf-8', 'ascii', 'iso8859-1']
-                        )
-                    }
-                ]
-                return (False, errors)
+            from xml.etree import ElementTree
+
+            response = http_request(url_scheme, base_url, root_url, timeout=2)
+            log.add_debug("UPnP: Device description response from %s://%s%s: %s",
+                          (url_scheme, base_url, root_url, response.encode('utf-8')))
+
+            xml = ElementTree.fromstring(response)
+
+            for service in xml.findall(".//{urn:schemas-upnp-org:device-1-0}service"):
+                service_type = service.find(".//{urn:schemas-upnp-org:device-1-0}serviceType").text
+                control_url = service.find(".//{urn:schemas-upnp-org:device-1-0}controlURL").text
+
+                if service_type in ("urn:schemas-upnp-org:service:WANIPConnection:1",
+                                    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+                                    "urn:schemas-upnp-org:service:WANIPConnection:2"):
+                    # We found a router with UPnP enabled
+                    break
+
             else:
-                # If the binary is available we define the resulting mode
-                self.mode = 'Binary'
-                return (True, None)
-        else:
-            # If the python binding import is successful we define the
-            # resulting mode
-            self.mode = 'Module'
-            return (True, None)
+                service_type = None
+                control_url = None
 
-    def AddPortMapping(self, frame, np):
-        """Wrapper to redirect the Port Mapping creation to either:
+        except Exception as error:
+            # Invalid response
+            log.add_debug("UPnP: Invalid device description response from %s://%s%s: %s",
+                          (url_scheme, base_url, root_url, error))
 
-        - The MiniUPnPc binary: upnpc.
-        - The python binding to the MiniUPnPc binary: miniupnpc.
+        return service_type, control_url
 
-        Both method support creating a Port Mapping
-        via the UPnP IGDv1 and IGDv2 protocol.
+    @staticmethod
+    def add_router(routers, ssdp_response):
 
-        Need a reference to NicotineFrame to update the interface with the WAN
-        external port chosen and connect to the slsk network.
-        Also need a reference to the np object to extract the internal LAN
-        local from the protothread socket.
+        from urllib.parse import urlsplit
+        response_headers = {k.upper(): v for k, v in ssdp_response.headers}
 
-        From the UPnP IGD reference:
-        http://upnp.org/specs/gw/UPnP-gw-WANIPConnection-v2-Service.pdf
+        log.add_debug("UPnP: Device search response: %s", bytes(ssdp_response))
 
-        IGDv1 and IGDV2: AddPortMapping:
-        This action creates a new port mapping or overwrites
-        an existing mapping with the same internal client.
-        If the ExternalPort and PortMappingProtocol pair is already mapped
-        to another internal client, an error is returned.
-
-        IGDv1: NewLeaseDuration:
-        This argument defines the duration of the port mapping.
-        If the value of this argument is 0, it means it's a static port mapping
-        that never expire.
-
-        IGDv2: NewLeaseDuration:
-        This argument defines the duration of the port mapping.
-        The value of this argument MUST be greater than 0.
-        A NewLeaseDuration with value 0 means static port mapping,
-        but static port mappings can only be created through
-        an out-of-band mechanism.
-        If this parameter is set to 0, default value of 604800 MUST be used.
-
-        BTW since we don't recheck periodically ports mappings
-        while nicotine+ runs, any UPnP port mapping done with IGDv2
-        (any modern router does that) will expire after 7 days.
-        The client won't be able to send/receive files anymore...
-        """
-
-        log.add(_('Creating Port Mapping rule via UPnP...'))
-
-        # Hack to found out the local LAN IP
-        # See https://stackoverflow.com/questions/166506/finding-local-ip-addresses-using-pythons-stdlib/28950776#28950776
-
-        # Create a UDP socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        # Send a broadcast packet on a local address (doesn't need to be reachable)
-        s.connect(('10.255.255.255', 0))
-
-        # This returns the "primary" IP on the local box, even if that IP is a NAT/private/internal IP.
-        self.internalipaddress = s.getsockname()[0]
-
-        # Close the socket
-        s.close()
-
-        # Store the Local LAN port
-        self.internallanport = np.protothread._p.getsockname()[1]
-
-        # The function depends on what method of configuring port mapping is
-        # available
-        functiontocall = getattr(self, 'AddPortMapping' + self.mode)
-
-        try:
-            functiontocall()
-        except Exception as e:
-            log.addwarning(_('UPnP exception: %(error)s') % {'error': str(e)})
-            log.addwarning(
-                _('Failed to automate the creation of ' +
-                    'UPnP Port Mapping rule.'))
+        if "LOCATION" not in response_headers:
+            log.add_debug("UPnP: M-SEARCH response did not contain a LOCATION header: %s", ssdp_response.headers)
             return
 
-        log.add(
-            _('Managed to map external WAN port %(externalwanport)s ' +
-                'on your external IP %(externalipaddress)s ' +
-                'to your local host %(internalipaddress)s ' +
-                'port %(internallanport)s.') %
-            {
-                'externalwanport': self.externalwanport,
-                'externalipaddress': self.externalipaddress,
-                'internalipaddress': self.internalipaddress,
-                'internallanport': self.internallanport
-            }
-        )
+        url_parts = urlsplit(response_headers["LOCATION"])
+        service_type, control_url = SSDP.get_router_control_url(url_parts.scheme, url_parts.netloc, url_parts.path)
 
-        # Set the external WAN port in the GUI
-        frame.networkcallback([slskmessages.IncPort(self.externalwanport)])
+        if service_type is None or control_url is None:
+            log.add_debug("UPnP: No router with UPnP enabled in device search response, ignoring")
+            return
 
-        # Establish the connection to the slsk network
-        frame.OnConnect(-1)
+        log.add_debug("UPnP: Device details: service_type '%s'; control_url '%s'", (service_type, control_url))
 
-    def AddPortMappingBinary(self):
-        """Function to create a Port Mapping via MiniUPnPc binary: upnpc.
+        routers.append(
+            Router(wan_ip_type=response_headers['ST'], url_scheme=url_parts.scheme,
+                   base_url=url_parts.netloc, root_url=url_parts.path,
+                   service_type=service_type, control_url=control_url))
 
-        It tries to reconstruct a datastructure identical to what the python
-        module does by parsing the output of the binary.
-        This help to have a bunch of common code to find a suitable
-        external WAN port later.
+        log.add_debug("UPnP: Added device to list")
 
-        IGDv1: If a Port Mapping already exist:
-            It's updated with a new static port mapping that does not expire.
-        IGDv2: If a Port Mapping already exist:
-            It's updated with a new lease duration of 7 days.
+    @staticmethod
+    def get_routers(private_ip=None):
+
+        log.add_debug("UPnP: Discovering... delay=%s seconds", SSDP.response_time_secs)
+
+        # Create a UDP socket and set its timeout
+        sock = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM, proto=socket.IPPROTO_UDP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, SSDP.response_time_secs)
+        sock.setblocking(False)
+
+        if private_ip:
+            sock.bind((private_ip, 0))
+
+        # Protocol 1
+        wan_ip1_sent = False
+        wan_ip1 = SSDPRequest("urn:schemas-upnp-org:service:WANIPConnection:1")
+
+        wan_ppp1_sent = False
+        wan_ppp1 = SSDPRequest("urn:schemas-upnp-org:service:WANPPPConnection:1")
+
+        wan_igd1_sent = False
+        wan_igd1 = SSDPRequest("urn:schemas-upnp-org:device:InternetGatewayDevice:1")
+
+        # Protocol 2
+        wan_ip2_sent = False
+        wan_ip2 = SSDPRequest("urn:schemas-upnp-org:service:WANIPConnection:2")
+
+        wan_igd2_sent = False
+        wan_igd2 = SSDPRequest("urn:schemas-upnp-org:device:InternetGatewayDevice:2")
+
+        routers = []
+        time_end = time.time() + SSDP.response_time_secs
+
+        while time.time() < time_end:
+            readable, writable, _ = select.select([sock], [sock], [sock], 0)
+
+            for sock in readable:
+                msg, _sender = sock.recvfrom(4096)
+                SSDP.add_router(routers, SSDPResponse(msg.decode('utf-8')))
+
+            for sock in writable:
+                if not wan_ip1_sent:
+                    wan_ip1.sendto(sock, (SSDP.multicast_host, SSDP.multicast_port))
+                    log.add_debug("UPnP: Sent M-SEARCH IP request 1")
+                    time_end = time.time() + SSDP.response_time_secs
+                    wan_ip1_sent = True
+
+                if not wan_ppp1_sent:
+                    wan_ppp1.sendto(sock, (SSDP.multicast_host, SSDP.multicast_port))
+                    log.add_debug("UPnP: Sent M-SEARCH PPP request 1")
+                    time_end = time.time() + SSDP.response_time_secs
+                    wan_ppp1_sent = True
+
+                if not wan_igd1_sent:
+                    wan_igd1.sendto(sock, (SSDP.multicast_host, SSDP.multicast_port))
+                    log.add_debug("UPnP: Sent M-SEARCH IGD request 1")
+                    time_end = time.time() + SSDP.response_time_secs
+                    wan_igd1_sent = True
+
+                if not wan_ip2_sent:
+                    wan_ip2.sendto(sock, (SSDP.multicast_host, SSDP.multicast_port))
+                    log.add_debug("UPnP: Sent M-SEARCH IP request 2")
+                    time_end = time.time() + SSDP.response_time_secs
+                    wan_ip2_sent = True
+
+                if not wan_igd2_sent:
+                    wan_igd2.sendto(sock, (SSDP.multicast_host, SSDP.multicast_port))
+                    log.add_debug("UPnP: Sent M-SEARCH IGD request 2")
+                    time_end = time.time() + SSDP.response_time_secs
+                    wan_igd2_sent = True
+
+            # Cooldown
+            time.sleep(0.01)
+
+        log.add_debug("UPnP: %s device(s) detected", str(len(routers)))
+
+        sock.close()
+        return routers
+
+
+class UPnP:
+    """ Class that handles UPnP Port Mapping """
+
+    request_body = ('<?xml version="1.0"?>\r\n'
+                    + '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+                    + 's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+                    + '<s:Body>'
+                    + '<u:AddPortMapping xmlns:u="%s">'
+                    + '<NewRemoteHost></NewRemoteHost>'
+                    + '<NewExternalPort>%s</NewExternalPort>'
+                    + '<NewProtocol>%s</NewProtocol>'
+                    + '<NewInternalPort>%s</NewInternalPort>'
+                    + '<NewInternalClient>%s</NewInternalClient>'
+                    + '<NewEnabled>1</NewEnabled>'
+                    + '<NewPortMappingDescription>%s</NewPortMappingDescription>'
+                    + '<NewLeaseDuration>%s</NewLeaseDuration>'
+                    + '</u:AddPortMapping>'
+                    + '</s:Body>'
+                    + '</s:Envelope>\r\n')
+
+    def __init__(self, core, config):
+
+        self.core = core
+        self.config = config
+        self.timer = None
+
+        self.add_port_mapping()
+
+    def _request_port_mapping(self, router, protocol, public_port, private_ip, private_port,
+                              mapping_description, lease_duration):
+        """
+        Function that adds a port mapping to the router.
+        If a port mapping already exists, it is updated with a lease period of 24 hours.
         """
 
-        # Listing existing ports mappings
-        log.adddebug('Listing existing Ports Mappings...')
+        from xml.etree import ElementTree
 
-        command = [self.upnpcbinary, '-l']
+        url = '%s%s' % (router.base_url, router.control_url)
+        log.add_debug("UPnP: Adding port mapping (%s %s/%s, %s) at url '%s'",
+                      (private_ip, private_port, protocol, router.search_target, url))
+
+        headers = {
+            "Host": router.base_url,
+            "Content-Type": "text/xml; charset=utf-8",
+            "SOAPACTION": '"%s#AddPortMapping"' % router.service_type
+        }
+
+        body = (self.request_body % (router.service_type, public_port, protocol, private_port, private_ip,
+                                     mapping_description, lease_duration)).encode('utf-8')
+
+        log.add_debug("UPnP: Add port mapping request headers: %s", headers)
+        log.add_debug("UPnP: Add port mapping request contents: %s", body)
+
+        response = http_request(
+            router.url_scheme, router.base_url, router.control_url,
+            request_type="POST", body=body, headers=headers)
+
+        xml = ElementTree.fromstring(response)
+
+        if not xml.find(".//{http://schemas.xmlsoap.org/soap/envelope/}Body"):
+            raise Exception(_("Invalid response: %s") % response.encode('utf-8'))
+
+        log.add_debug("UPnP: Add port mapping response: %s", response.encode('utf-8'))
+
+        error_code = xml.findtext(".//{urn:schemas-upnp-org:control-1-0}errorCode")
+        error_description = xml.findtext(".//{urn:schemas-upnp-org:control-1-0}errorDescription")
+
+        if error_code or error_description:
+            raise Exception(_("Error code %(code)s: %(description)s") %
+                            {"code": error_code, "description": error_description})
+
+    @staticmethod
+    def find_local_ip_address():
+
+        # Create a UDP socket
+        local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Send a broadcast packet on a local address (doesn't need to be reachable,
+        # but MacOS requires port to be non-zero)
+        local_socket.connect(("10.255.255.255", 1))
+
+        # This returns the "primary" IP on the local box, even if that IP is a NAT/private/internal IP.
+        ip_address = local_socket.getsockname()[0]
+
+        # Close the socket
+        local_socket.close()
+
+        return ip_address
+
+    @staticmethod
+    def find_router(private_ip=None):
+
+        routers = SSDP.get_routers(private_ip)
+        router = next((r for r in routers if r.search_target == "urn:schemas-upnp-org:service:WANIPConnection:2"), None)
+
+        if not router:
+            router = next(
+                (r for r in routers if r.search_target == "urn:schemas-upnp-org:service:WANIPConnection:1"), None)
+
+        if not router:
+            router = next(
+                (r for r in routers if r.search_target == "urn:schemas-upnp-org:service:WANPPPConnection:1"), None)
+
+        if not router:
+            router = next(
+                (r for r in routers if r.search_target == "urn:schemas-upnp-org:device:InternetGatewayDevice:2"), None)
+
+        if not router:
+            router = next(
+                (r for r in routers if r.search_target == "urn:schemas-upnp-org:device:InternetGatewayDevice:1"), None)
+
+        if not router:
+            router = next((r for r in routers), None)
+
+        return router
+
+    def _update_port_mapping(self, listening_port):
+        """
+        This function supports creating a Port Mapping via the UPnP
+        IGDv1 and IGDv2 protocol.
+
+        Any UPnP port mapping done with IGDv2 will expire after a
+        maximum of 7 days (lease period), according to the protocol.
+        We set the lease period to a shorter 24 hours, and regularly
+        renew the port mapping.
+        """
+
         try:
-            output = self.run_binary(command)
-        except Exception as e:
-            raise RuntimeError(
-                _('Failed to use UPnPc binary: %(error)s') % {'error': str(e)})
+            log.add_debug("UPnP: Creating Port Mapping rule...")
 
-        # Build a list of tuples of the mappings
-        # with the same format as in the python module
-        # (ePort, protocol, (intClient, iPort), desc, enabled, rHost, duration)
-        # (15000, 'TCP', ('192.168.0.1', 2234), 'Nicotine+', '1', '', 0)
-        #
-        # Also get the external WAN IP
-        #
-        # Output format :
-        # ...
-        # ExternalIPAddress = X.X.X.X
-        # ...
-        #  i protocol exPort->inAddr:inPort description remoteHost leaseTime
-        #  0 TCP 15000->192.168.0.1:2234  'Nicotine+' '' 0
+            # Find local IP address
+            local_ip_address = self.find_local_ip_address()
 
-        re_ip = re.compile(r"""
-            ^
-                ExternalIPAddress
-                \s+ = \s+
-                (?P<ip> \d+ \. \d+ \. \d+ \. \d+ )?
-            $
-        """, re.VERBOSE)
+            # Find router
+            router = self.find_router(local_ip_address)
 
-        re_mapping = re.compile(r"""
-            ^
-                \d+ \s+
-                (?P<protocol> \w+ ) \s+
-                (?P<ePort> \d+ ) ->
-                (?P<intClient> \d+ \. \d+ \. \d+ \. \d+ ) :
-                (?P<iPort> \d+ ) \s+
-                ' (?P<desc> .* ) ' \s+
-                ' (?P<rHost> .* ) ' \s+
-                (?P<duration> \d+ )
-            $
-        """, re.VERBOSE)
+            if not router:
+                raise RuntimeError(_("UPnP is not available on this network"))
 
-        for line in output.split('\n'):
+            # Perform the port mapping
+            log.add_debug("UPnP: Trying to redirect external WAN port %s TCP => %s port %s TCP", (
+                listening_port,
+                local_ip_address,
+                listening_port
+            ))
 
-            line = line.strip()
-
-            ip_match = re.match(re_ip, line)
-            mapping_match = re.match(re_mapping, line)
-
-            if ip_match:
-                self.externalipaddress = ip_match.group('ip')
-                next
-
-            if mapping_match:
-                enabled = '1'
-                self.existingportsmappings.append(
-                    (
-                        int(mapping_match.group('ePort')),
-                        mapping_match.group('protocol'),
-                        (mapping_match.group('intClient'),
-                         int(mapping_match.group('iPort'))),
-                        mapping_match.group('desc'),
-                        enabled,
-                        mapping_match.group('rHost'),
-                        int(mapping_match.group('duration'))
-                    )
+            try:
+                self._request_port_mapping(
+                    router=router,
+                    protocol="TCP",
+                    public_port=listening_port,
+                    private_ip=local_ip_address,
+                    private_port=listening_port,
+                    mapping_description="NicotinePlus",
+                    lease_duration=86400  # Expires in 24 hours
                 )
 
-        # Find a suitable external WAN port to map to based
-        # on the existing mappings
-        self.FindSuitableExternalWANPort()
-
-        # Do the port mapping
-        log.adddebug('Trying to redirect %s port %s TCP => %s port %s TCP' %
-                     (
-                         self.externalipaddress,
-                         self.externalwanport,
-                         self.internalipaddress,
-                         self.internallanport
-                     )
-                     )
-
-        command = [
-            self.upnpcbinary,
-            '-e',
-            '"Nicotine+"',
-            '-a',
-            str(self.internalipaddress),
-            str(self.internallanport),
-            str(self.externalwanport),
-            'TCP'
-        ]
-
-        try:
-            output = self.run_binary(command)
-        except Exception as e:
-            raise RuntimeError(
-                _('Failed to use UPnPc binary: %(error)s') % {'error': str(e)})
-
-        for line in output.split('\n'):
-            if line.startswith("external ") and \
-               line.find(" is redirected to internal ") > -1:
-                log.adddebug('Success')
-                return
-            if line.find(" failed with code ") > -1:
-                log.adddebug('Failed')
+            except Exception as error:
                 raise RuntimeError(
-                    _('Failed to map the external WAN port: %(error)s') %
-                    {'error': str(line)})
+                    _("Failed to map the external WAN port: %(error)s") % {"error": error}) from error
 
-        raise AssertionError(
-            _('UPnPc binary failed, could not parse output: %(output)s') %
-            {'output': str(output)})
+        except Exception as error:
+            from traceback import format_exc
+            log.add(_("UPnP: Failed to forward external port %(external_port)s: %(error)s"), {
+                "external_port": listening_port,
+                "error": error
+            })
+            log.add_debug(format_exc())
+            return
 
-    def AddPortMappingModule(self):
-        """Function to create a Port Mapping via the python binding: miniupnpc.
+        log.add(_("UPnP: External port %(external_port)s successfully forwarded to local "
+                  "IP address %(ip_address)s port %(local_port)s"), {
+            "external_port": listening_port,
+            "ip_address": local_ip_address,
+            "local_port": listening_port
+        })
 
-        IGDv1: If a Port Mapping already exist:
-            It's updated with a new static port mapping that does not expire.
-        IGDv2: If a Port Mapping already exist:
-            It's updated with a new lease duration of 7 days.
-        """
+    def add_port_mapping(self):
 
-        import miniupnpc
-
-        u = miniupnpc.UPnP()
-        u.discoverdelay = self.discoverdelay
-
-        # Discovering devices
-        log.adddebug('Discovering... delay=%sms' % u.discoverdelay)
-
-        try:
-            log.adddebug('%s device(s) detected' % u.discover())
-        except Exception as e:
-            raise RuntimeError(
-                _('UPnP exception (should never happen): %(error)s') %
-                {'error': str(e)})
-
-        # Select an IGD
-        try:
-            u.selectigd()
-        except Exception as e:
-            raise RuntimeError(
-                _('Cannot select an IGD : %(error)s') %
-                {'error': str(e)})
-
-        self.externalipaddress = u.externalipaddress()
-        log.adddebug('IGD selected : External IP address: %s' %
-                     (self.externalipaddress))
-
-        # Build existing ports mappings list
-        log.adddebug('Listing existing Ports Mappings...')
-
-        i = 0
-        while True:
-            p = u.getgenericportmapping(i)
-            if p is None:
-                break
-            self.existingportsmappings.append(p)
-            i += 1
-
-        # Find a suitable external WAN port to map to based on the existing
-        # mappings
-        self.FindSuitableExternalWANPort()
+        # Test if we want to do a port mapping
+        if not self.config.sections["server"]["upnp"]:
+            return
 
         # Do the port mapping
-        log.adddebug('Trying to redirect %s port %s TCP => %s port %s TCP' %
-                     (
-                         self.externalipaddress,
-                         self.externalwanport,
-                         self.internalipaddress,
-                         self.internallanport
-                     )
-                     )
+        thread = threading.Thread(target=self._add_port_mapping)
+        thread.name = "UPnPAddPortmapping"
+        thread.daemon = True
+        thread.start()
 
-        try:
-            u.addportmapping(self.externalwanport, 'TCP',
-                             self.internalipaddress,
-                             self.internallanport, 'Nicotine+', '')
-        except Exception as e:
-            log.adddebug('Failed')
-            raise RuntimeError(
-                _('Failed to map the external WAN port: %(error)s') %
-                {'error': str(e)}
-            )
+        # Repeat
+        self._start_timer()
 
-        log.adddebug('Success')
+    def _add_port_mapping(self):
+        self._update_port_mapping(self.core.protothread.listenport)
 
-    def FindSuitableExternalWANPort(self):
-        """Function to find a suitable external WAN port to map to the client.
+    def _start_timer(self):
+        """ Port mapping entries last 24 hours, we need to regularly renew them.
+        The default interval is 4 hours. """
 
-        It will detect if a port mapping to the client already exist.
-        """
+        self.cancel_timer()
+        upnp_interval = self.config.sections["server"]["upnp_interval"]
 
-        # Output format: (ePort, protocol, (intClient, iPort), desc, enabled,
-        # rHost, duration)
-        log.adddebug('Existing Port Mappings: %s' % (
-            sorted(self.existingportsmappings, key=lambda tup: tup[0])))
+        if upnp_interval < 1:
+            return
 
-        # Analyze ports mappings
-        for m in sorted(self.existingportsmappings, key=lambda tup: tup[0]):
+        upnp_interval_seconds = upnp_interval * 60 * 60
 
-            (ePort, protocol, (intClient, iPort),
-             desc, enabled, rhost, duration) = m
+        self.timer = threading.Timer(upnp_interval_seconds, self.add_port_mapping)
+        self.timer.name = "UPnPTimer"
+        self.timer.daemon = True
+        self.timer.start()
 
-            # A Port Mapping is already in place with the client: we will
-            # rewrite it to avoid a timeout on the duration of the mapping
-            if protocol == "TCP" and \
-               str(intClient) == str(self.internalipaddress) and \
-               iPort == self.internallanport:
-                log.adddebug('Port Mapping already in place: %s' % str(m))
-                self.externalwanport = ePort
-                self.foundexistingmapping = True
-                break
-
-        # If no mapping already in place we try to found a suitable external
-        # WAN port
-        if not self.foundexistingmapping:
-
-            # Find the first external WAN port > requestedwanport that's not
-            # already reserved
-            tcpportsreserved = [x[0] for x in sorted(
-                self.existingportsmappings) if x[1] == "TCP"]
-
-            while self.externalwanport in tcpportsreserved:
-                if self.externalwanport + 1 <= 65535:
-                    self.externalwanport += 1
-                else:
-                    raise AssertionError(
-                        _('Failed to find a suitable external WAN port, ' +
-                            'bailing out.'))
+    def cancel_timer(self):
+        if self.timer:
+            self.timer.cancel()

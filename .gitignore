@@ -1,5 +1,9 @@
-# Temporary translation files
-languages/nicotine-*.pot
+# Auto-generated files
+*.desktop
+*.metainfo.xml
+
+# Translation Machine Object files
+*.mo
 
 # Python byte code files
 *.pyc
@@ -7,10 +11,22 @@ languages/nicotine-*.pot
 # Pot backup files
 *.po~
 
+# Temporary test files
+test/**/*temp_config*
+test/**/*.db
+test/**/*.json
+test/**/*.old
+
 # Ignore venv files
 venv/*
+.env/
 
 # Ignore packaging directories and files
+install.txt
 MANIFEST
 build/
 dist/
+debian/files
+nicotine_plus.egg-info/
+packaging/flatpak/build-dir/
+packaging/flatpak/.flatpak-builder/

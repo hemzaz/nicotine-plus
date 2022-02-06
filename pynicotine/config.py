@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-#
+# COPYRIGHT (C) 2020-2022 Nicotine+ Team
 # COPYRIGHT (C) 2016-2017 Michael Labouebe <gfarmerfr@free.fr>
 # COPYRIGHT (C) 2016-2018 Mutnick <mutnick@techie.com>
 # COPYRIGHT (C) 2008-2011 Quinox <quinox@users.sf.net>
@@ -29,20 +28,12 @@
 This module contains configuration classes for Nicotine.
 """
 
-import ConfigParser
-import string
+import configparser
 import os
-import time
-import cPickle
-import bz2
-import shelve
 import sys
-import thread
 
-from os.path import exists
-
-from logfacility import log
-from utils import findBestEncoding
+from ast import literal_eval
+from collections import defaultdict
 
 
 class Config:
@@ -50,127 +41,202 @@ class Config:
     This class holds configuration information and provides the
     following methods:
 
-    needConfig() - returns true if configuration information is incomplete
-    readConfig() - reads configuration information from ~/.nicotine/config
-    setConfig(config_info_dict) - sets configuration information
-    writeConfiguration - writes configuration information to ~/.nicotine/config
-    writeDownloadQueue - writes download queue to ~/.nicotine/config.transfers.pickle
-    writeConfig - calls writeConfiguration followed by writeDownloadQueue
+    need_config() - returns true if configuration information is incomplete
+    read_config() - reads configuration information from file
+    write_configuration - writes configuration information to file
 
     The actual configuration information is stored as a two-level dictionary.
     First-level keys are config sections, second-level keys are config
     parameters.
     """
 
-    def __init__(self, filename):
+    def __init__(self):
 
-        self.config_lock = thread.allocate_lock()
-        self.config_lock.acquire()
-        self.frame = None
-        self.filename = filename
-        self.parser = ConfigParser.ConfigParser()
-        self.parser.read([self.filename])
+        config_dir, self.data_dir = self.get_user_directories()
+        self.filename = os.path.join(config_dir, "config")
+        self.plugin_dir = os.path.join(self.data_dir, "plugins")
+        self.version = "3.2.1.rc3"
+        self.python_version = sys.version
+        self.gtk_version = ""
 
-        LOGDIR = os.path.join(self.filename.rsplit(os.sep, 1)[0], "logs")
+        self.application_name = "Nicotine+"
+        self.application_id = "org.nicotine_plus.Nicotine"
+        self.summary = _("Graphical client for the Soulseek peer-to-peer network")
+        self.copyright = """© 2004–2022 Nicotine+ Team
+© 2003–2004 Nicotine Team
+© 2001–2003 PySoulSeek Contributors"""
 
-        self.sections = {
+        self.website_url = "https://nicotine-plus.org/"
+        self.privileges_url = "https://www.slsknet.org/userlogin.php?username=%s"
+        self.portchecker_url = "http://tools.slsknet.org/porttest.php?port=%s"
+        self.issue_tracker_url = "https://github.com/nicotine-plus/nicotine-plus/issues"
+        self.translations_url = "https://nicotine-plus.org/doc/TRANSLATIONS"
+
+        self.config_loaded = False
+        self.parser = configparser.ConfigParser(strict=False, interpolation=None)
+        self.sections = defaultdict(dict)
+        self.defaults = {}
+        self.removed_options = {}
+
+    @staticmethod
+    def get_user_directories():
+        """ Returns a tuple:
+        - the config directory
+        - the data directory """
+
+        if sys.platform == "win32":
+            try:
+                data_dir = os.path.join(os.environ['APPDATA'], 'nicotine')
+            except KeyError:
+                data_dir, _filename = os.path.split(sys.argv[0])
+
+            config_dir = os.path.join(data_dir, "config")
+            return config_dir, data_dir
+
+        home = os.path.expanduser("~")
+
+        legacy_dir = os.path.join(home, '.nicotine')
+
+        if os.path.isdir(legacy_dir):
+            return legacy_dir, legacy_dir
+
+        def xdg_path(xdg, default):
+            path = os.environ.get(xdg)
+
+            path = path.split(':')[0] if path else default
+
+            return os.path.join(path, 'nicotine')
+
+        config_dir = xdg_path('XDG_CONFIG_HOME', os.path.join(home, '.config'))
+        data_dir = xdg_path('XDG_DATA_HOME', os.path.join(home, '.local', 'share'))
+
+        return config_dir, data_dir
+
+    def create_config_folder(self):
+        """ Create the folder for storing the config file in, if the folder
+        doesn't exist """
+
+        path, _filename = os.path.split(self.filename)
+
+        if not path:
+            # Only file name specified, use current folder
+            return True
+
+        try:
+            if not os.path.isdir(path):
+                os.makedirs(path)
+
+        except OSError as msg:
+            from pynicotine.logfacility import log
+
+            log.add(_("Can't create directory '%(path)s', reported error: %(error)s"),
+                    {'path': path, 'error': msg})
+            return False
+
+        return True
+
+    def create_data_folder(self):
+        """ Create the folder for storing data in (aliases, shared files etc.),
+        if the folder doesn't exist """
+
+        try:
+            if not os.path.isdir(self.data_dir):
+                os.makedirs(self.data_dir)
+
+        except OSError as msg:
+            from pynicotine.logfacility import log
+
+            log.add(_("Can't create directory '%(path)s', reported error: %(error)s"),
+                    {'path': self.data_dir, 'error': msg})
+
+    def load_config(self):
+
+        from pynicotine.utils import load_file
+
+        log_dir = os.path.join(self.data_dir, "logs")
+        self.defaults = {
             "server": {
-                "server": ('server.slsknet.org', 2242),
-                "login": '',
-                "passw": '',
-                "firewalled": 1,
-                "ctcpmsgs": 0,
+                "server": ("server.slsknet.org", 2242),
+                "login": "",
+                "passw": "",
+                "interface": "",
+                "ctcpmsgs": False,
                 "autosearch": [],
                 "autoreply": "",
-                "roomencoding": {},
-                "fallbackencodings": ['utf-8', 'cp1252'],  # Put the multi-byte encodings up front - they are the most likely to err
-                "userencoding": {},
                 "portrange": (2234, 2239),
-                "upnp": False,
-                "enc": "utf-8",
+                "upnp": True,
+                "upnp_interval": 4,
+                "auto_connect_startup": True,
                 "userlist": [],
                 "banlist": [],
                 "ignorelist": [],
                 "ipignorelist": {},
-                "ipblocklist": {"72.172.88.*": "MediaDefender Bots"},
+                "ipblocklist": {},
                 "autojoin": ["nicotine"],
                 "autoaway": 15,
-                "private_chatrooms": 0
+                "away": False,
+                "private_chatrooms": False,
+                "command_aliases": {}
             },
-
             "transfers": {
-                "incompletedir": os.path.join(os.path.expanduser("~"), '.nicotine', 'incompletefiles'),
-                "downloaddir": os.path.join(os.path.expanduser("~"), 'nicotine-downloads'),
-                "uploaddir": os.path.join(os.path.expanduser("~"), 'nicotine-uploads'),
-                "sharedownloaddir": 0,
+                "incompletedir": os.path.join(self.data_dir, 'incomplete'),
+                "downloaddir": os.path.join(self.data_dir, 'downloads'),
+                "uploaddir": os.path.join(self.data_dir, 'received'),
+                "usernamesubfolders": False,
                 "shared": [],
                 "buddyshared": [],
                 "uploadbandwidth": 10,
-                "uselimit": 0,
-                "uploadlimit": 150,
+                "uselimit": False,
+                "usealtlimits": False,
+                "uploadlimit": 1000,
+                "uploadlimitalt": 100,
                 "downloadlimit": 0,
-                "preferfriends": 0,
-                "useupslots": 0,
+                "downloadlimitalt": 100,
+                "preferfriends": False,
+                "useupslots": False,
                 "uploadslots": 2,
-                "shownotification": 0,
-                "shownotificationperfolder": 0,
                 "afterfinish": "",
                 "afterfolder": "",
-                "lock": 1,
-                "reverseorder": 0,
-                "prioritize": 0,
-                "fifoqueue": 0,
-                "usecustomban": 0,
-                "limitby": 1,
+                "lock": True,
+                "reverseorder": False,
+                "fifoqueue": False,
+                "usecustomban": False,
+                "limitby": True,
                 "customban": "Banned, don't bother retrying",
-                "queuelimit": 100,
-                "filelimit": 1000,
-                "friendsonly": 0,
-                "friendsnolimits": 0,
-                "enablebuddyshares": 0,
-                "enabletransferbuttons": 1,
-                "groupdownloads": 0,
-                "groupuploads": 1,
-                "geoblock": 0,
-                "geopanic": 0,
+                "usecustomgeoblock": False,
+                "customgeoblock": "Sorry, your country is blocked",
+                "queuelimit": 10000,
+                "filelimit": 100,
+                "buddysharestrustedonly": False,
+                "friendsnolimits": False,
+                "groupdownloads": "folder_grouping",
+                "groupuploads": "folder_grouping",
+                "geoblock": False,
                 "geoblockcc": [""],
-                "remotedownloads": 1,
+                "remotedownloads": True,
                 "uploadallowed": 2,
-                "autoclear_uploads": 0,
-                "autoretry_downloads": 0,
-                "downloads": [],
-                "sharedfiles": {},
-                "sharedfilesstreams": {},
-                "uploadsinsubdirs": 1,
-                "wordindex": {},
-                "fileindex": {},
-                "sharedmtimes": {},
-                "bsharedfiles": {},
-                "bsharedfilesstreams": {},
-                "bwordindex": {},
-                "bfileindex": {},
-                "bsharedmtimes": {},
-                "rescanonstartup": 0,
-                "enablefilters": 1,
+                "autoclear_downloads": False,
+                "autoclear_uploads": False,
+                "uploadsinsubdirs": True,
+                "rescanonstartup": True,
+                "enablefilters": False,
                 "downloadregexp": "",
                 "downloadfilters": [
                     ["desktop.ini", 1],
                     ["folder.jpg", 1],
                     ["*.url", 1],
                     ["thumbs.db", 1],
-                    ["albumart(_{........-....-....-....-............}_)?(_?(large|small))?\.jpg", 0]
+                    ["albumart(_{........-....-....-....-............}_)?(_?(large|small))?\\.jpg", 0]
                 ],
                 "download_doubleclick": 1,
                 "upload_doubleclick": 1,
                 "downloadsexpanded": True,
                 "uploadsexpanded": True
             },
-
             "userinfo": {
                 "descr": "''",
                 "pic": ""
             },
-
             "words": {
                 "censored": [],
                 "autoreplaced": {
@@ -187,807 +253,525 @@ class Config:
                 "replacewords": False,
                 "tab": True,
                 "cycle": False,
-                "dropdown": True,
-                "characters": 2,
+                "dropdown": False,
+                "characters": 3,
                 "roomnames": True,
                 "buddies": True,
                 "roomusers": True,
                 "commands": True,
                 "aliases": True,
-                "onematch": True
+                "onematch": False
             },
-
             "logging": {
                 "debug": False,
-                "debugmodes": [0, 1],
-                "logcollapsed": 0,
-                "logsdir": os.path.expanduser(LOGDIR),
+                "debugmodes": [],
+                "debuglogsdir": os.path.join(log_dir, "debug"),
+                "logcollapsed": True,
+                "transferslogsdir": os.path.join(log_dir, "transfers"),
                 "rooms_timestamp": "%H:%M:%S",
                 "private_timestamp": "%Y-%m-%d %H:%M:%S",
                 "log_timestamp": "%Y-%m-%d %H:%M:%S",
-                "timestamps": 1,
-                "privatechat": 0,
-                "chatrooms": 0,
-                "transfers": 0,
-                "roomlogsdir": os.path.expanduser(os.path.join(LOGDIR, "rooms")),
-                "privatelogsdir": os.path.expanduser(os.path.join(LOGDIR, "private")),
-                "readroomlogs": 1,
+                "timestamps": True,
+                "privatechat": True,
+                "chatrooms": True,
+                "transfers": False,
+                "debug_file_output": False,
+                "roomlogsdir": os.path.join(log_dir, "rooms"),
+                "privatelogsdir": os.path.join(log_dir, "private"),
+                "readroomlogs": True,
                 "readroomlines": 15,
                 "readprivatelines": 15,
                 "rooms": []
             },
-
             "privatechat": {
-                "store": 0,
+                "store": True,
                 "users": []
             },
-
             "columns": {
-                "userlist": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                "userlist_widths": [0, 25, 120, 0, 0, 0, 0, 0, 160],
-                "chatrooms": {},
-                "downloads_columns": [1, 1, 1, 1, 1, 1, 1, 1, 1],
-                "downloads_widths": [100, 250, 140, 50, 70, 170, 90, 140, 120, 1000],
-                "uploads_columns": [1, 1, 1, 1, 1, 1, 1, 1, 1],
-                "uploads_widths": [100, 250, 140, 50, 70, 170, 90, 140, 120, 1000],
-                "search": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-                "search_widths": [50, 100, 250, 100, 90, 50, 20, 50, 50, 25, 1000],
-                "hideflags": False
+                "file_search": {},
+                "download": {},
+                "upload": {},
+                "user_browse": {},
+                "buddy_list": {},
+                "chat_room": {}
             },
-
             "searches": {
+                "expand_searches": True,
+                "group_searches": "folder_grouping",
                 "maxresults": 50,
-                "re_filter": 0,
+                "enable_history": True,
                 "history": [],
-                "enablefilters": 0,
+                "enablefilters": False,
+                "filters_visible": False,
                 "defilter": ["", "", "", "", 0, ""],
                 "filtercc": [],
-                "reopen_tabs": False,
                 "filterin": [],
                 "filterout": [],
                 "filtersize": [],
                 "filterbr": [],
-                "distrib_timer": 0,
-                "distrib_ignore": 60,
-                "search_results": 1,
-                "max_displayed_results": 500,
-                "max_stored_results": 1500
+                "filtertype": [],
+                "search_results": True,
+                "max_displayed_results": 1500,
+                "min_search_chars": 3,
+                "remove_special_chars": True,
+                "private_search_results": True
             },
-
             "ui": {
+                "dark_mode": False,
+                "header_bar": True,
                 "icontheme": "",
-                "chatme": "FOREST GREEN",
+                "chatme": "#908e8b",
                 "chatremote": "",
-                "chatlocal": "BLUE",
-                "chathilite": "red",
-                "urlcolor": "#3D2B7F",
-                "useronline": "BLACK",
-                "useraway": "ORANGE",
-                "useroffline": "#aa0000",
-                "usernamehotspots": 1,
+                "chatlocal": "",
+                "chathilite": "#5288ce",
+                "urlcolor": "#5288ce",
+                "useronline": "#16bb5c",
+                "useraway": "#c9ae13",
+                "useroffline": "#e04f5e",
+                "usernamehotspots": True,
                 "usernamestyle": "bold",
                 "textbg": "",
                 "search": "",
                 "searchq": "GREY",
                 "inputcolor": "",
-                "spellcheck": 1,
+                "spellcheck": True,
                 "exitdialog": 1,
-                "notexists": 1,
-                "tab_colors": 0,
                 "tab_default": "",
-                "tab_hilite": "red",
-                "tab_changed": "#0000ff",
-                "tab_reorderable": 1,
+                "tab_hilite": "#497ec2",
+                "tab_changed": "#497ec2",
+                "tab_select_previous": True,
                 "tabmain": "Top",
                 "tabrooms": "Top",
                 "tabprivate": "Top",
                 "tabinfo": "Top",
                 "tabbrowse": "Top",
                 "tabsearch": "Top",
-                "tab_icons": 1,
-                "tab_status_icons": 1,
-                "chat_hidebuttons": 0,
-                "labelmain": 0,
-                "labelrooms": 0,
-                "labelprivate": 0,
-                "labelinfo": 0,
-                "labelbrowse": 0,
-                "labelsearch": 0,
-                "decimalsep": ",",
+                "tab_status_icons": True,
+                "globalfont": "",
                 "chatfont": "",
-                "roomlistcollapsed": 0,
-                "tabclosers": 1,
+                "tabclosers": True,
                 "searchfont": "",
                 "listfont": "",
                 "browserfont": "",
                 "transfersfont": "",
+                "last_tab_id": "",
                 "modes_visible": {
-                    "chatrooms": 1,
-                    "private": 1,
-                    "downloads": 1,
-                    "uploads": 1,
-                    "search": 1,
-                    "userinfo": 1,
-                    "userbrowse": 1,
-                    "interests": 1
+                    "search": True,
+                    "downloads": True,
+                    "uploads": True,
+                    "userbrowse": True,
+                    "userinfo": True,
+                    "private": True,
+                    "chatrooms": True,
+                    "interests": True
                 },
                 "modes_order": [
-                    "chatrooms",
-                    "private",
+                    "search",
                     "downloads",
                     "uploads",
-                    "search",
-                    "userinfo",
                     "userbrowse",
-                    "interests",
-                    "userlist"
+                    "userinfo",
+                    "private",
+                    "userlist",
+                    "chatrooms",
+                    "interests"
                 ],
-                "searchoffline": "#aa0000",
-                "showaway": 0,
-                "buddylistinchatrooms": 0,
-                "trayicon": 1,
-                "soundenabled": 1,
-                "soundtheme": "",
-                "soundcommand": "play -q",
-                "filemanager": "xdg-open $",
-                "speechenabled": 0,
-                "speechprivate": "%(user)s told you.. %(message)s",
-                "speechrooms": "In %(room)s, %(user)s said %(message)s",
+                "buddylistinchatrooms": "tab",
+                "trayicon": True,
+                "startup_hidden": False,
+                "filemanager": "",
+                "speechenabled": False,
+                "speechprivate": "User %(user)s told you: %(message)s",
+                "speechrooms": "In room %(room)s, user %(user)s said: %(message)s",
                 "speechcommand": "flite -t $",
-                "width": 800,
+                "width": 1000,
                 "height": 600,
                 "xposition": -1,
                 "yposition": -1,
-                "urgencyhint": True
+                "maximized": True,
+                "urgencyhint": True,
+                "file_path_tooltips": True,
+                "reverse_file_paths": True
             },
-
             "private_rooms": {
-                "rooms": {},
-                "enabled": 0
+                "rooms": {}
             },
-
             "urls": {
-                "urlcatching": 1,
-                "protocols": {"http": "", "https": ""},
-                "humanizeurls": 1
+                "protocols": {}
             },
-
             "interests": {
                 "likes": [],
                 "dislikes": []
             },
-
-            "ticker": {
-                "default": "",
-                "rooms": {},
-                "hide": 0
-            },
-
             "players": {
-                "default": "xdg-open $",
+                "default": "",
                 "npothercommand": "",
-                "npplayer": "",
+                "npplayer": "mpris",
                 "npformatlist": [],
                 "npformat": ""
             },
-
+            "notifications": {
+                "notification_window_title": True,
+                "notification_tab_colors": False,
+                "notification_popup_sound": False,
+                "notification_popup_file": True,
+                "notification_popup_folder": True,
+                "notification_popup_private_message": True,
+                "notification_popup_chatroom": False,
+                "notification_popup_chatroom_mention": True
+            },
             "plugins": {
-                "enable": 1,
+                "enable": True,
                 "enabled": []
+            },
+            "statistics": {
+                "started_downloads": 0,
+                "completed_downloads": 0,
+                "downloaded_size": 0,
+                "started_uploads": 0,
+                "completed_uploads": 0,
+                "uploaded_size": 0
             }
         }
 
-        # URls handling for Windows
-        if sys.platform.startswith('win'):
-            self.sections["urls"]["protocols"] = {
-                "http": "python -m webbrowser -t $",
-                "https": "python -m webbrowser -t $"
-            }
-
-        # URls handling for Linux
-        if sys.platform.startswith('linux'):
-            self.sections["urls"]["protocols"] = {
-                "http": "xdg-open $",
-                "https": "xdg-open $"
-            }
+        self.removed_options = {
+            "transfers": (
+                "pmqueueddir",
+                "autoretry_downloads",
+                "shownotification",
+                "shownotificationperfolder",
+                "prioritize",
+                "sharedownloaddir",
+                "geopanic",
+                "enablebuddyshares",
+                "friendsonly",
+                "enabletransferbuttons"
+            ),
+            "server": (
+                "lastportstatuscheck",
+                "serverlist",
+                "enc",
+                "fallbackencodings",
+                "roomencoding",
+                "userencoding",
+                "firewalled"
+            ),
+            "ui": (
+                "enabletrans",
+                "mozembed",
+                "open_in_mozembed",
+                "tooltips",
+                "transalpha",
+                "transfilter",
+                "transtint",
+                "soundenabled",
+                "soundtheme",
+                "soundcommand",
+                "tab_colors",
+                "tab_icons",
+                "searchoffline",
+                "chat_hidebuttons",
+                "tab_reorderable",
+                "private_search_results",
+                "private_shares",
+                "labelmain",
+                "labelrooms",
+                "labelprivate",
+                "labelinfo",
+                "labelbrowse",
+                "labelsearch",
+                "notexists",
+                "roomlistcollapsed",
+                "showaway",
+                "decimalsep"
+            ),
+            "columns": (
+                "downloads",
+                "uploads",
+                "search",
+                "search_widths",
+                "downloads_columns",
+                "downloads_widths",
+                "uploads_columns",
+                "uploads_widths",
+                "userbrowse",
+                "userbrowse_widths",
+                "userlist",
+                "userlist_widths",
+                "chatrooms",
+                "chatrooms_widths",
+                "download_columns",
+                "download_widths",
+                "upload_columns",
+                "upload_widths",
+                "filesearch_columns",
+                "filesearch_widths",
+                "hideflags"
+            ),
+            "searches": (
+                "distrib_timer",
+                "distrib_ignore",
+                "reopen_tabs",
+                "max_stored_results",
+                "re_filter"
+            ),
+            "userinfo": (
+                "descrutf8"
+            ),
+            "private_rooms": (
+                "enabled"
+            ),
+            "logging": (
+                "logsdir"
+            ),
+            "ticker": (
+                "default",
+                "rooms",
+                "hide"
+            ),
+            "language": (
+                "language",
+                "setlanguage"
+            ),
+            "urls": (
+                "urlcatching",
+                "humanizeurls"
+            ),
+            "notifications": (
+                "notification_tab_icons"
+            )
+        }
 
         # Windows specific stuff
-        if sys.platform.startswith('win'):
-            self.sections['ui']['filemanager'] = 'explorer $'
-            self.sections['transfers']['incompletedir'] = os.path.join(os.environ['APPDATA'], 'nicotine', 'incompletefiles')
-            self.sections['transfers']['downloaddir'] = os.path.join(os.environ['APPDATA'], 'nicotine', 'uploads')
-            self.sections['transfers']['uploaddir'] = os.path.join(os.environ['APPDATA'], 'nicotine', 'uploads')
+        if sys.platform == "win32":
+            self.defaults['players']['npplayer'] = 'other'
 
-        self.defaults = {}
-        for key, value in self.sections.items():
-            if type(value) is dict:
-                if key not in self.defaults:
-                    self.defaults[key] = {}
+        # Initialize config with default values
+        for key, value in self.defaults.items():
+            self.sections[key] = value.copy()
 
-                for key2, value2 in value.items():
-                    self.defaults[key][key2] = value2
-            else:
-                self.defaults[key] = value
+        self.create_config_folder()
+        self.create_data_folder()
+
+        load_file(self.filename, self.parse_config)
+
+        # Update config values from file
+        self.set_config()
+
+        if sys.platform == "darwin":
+            # Disable header bar in macOS for now due to GTK 3 performance issues
+            self.sections["ui"]["header_bar"] = False
+
+        # Convert special download folder share to regular share
+        if self.sections["transfers"].get("sharedownloaddir", False):
+            shares = self.sections["transfers"]["shared"]
+            virtual_name = "Downloaded"
+            shared_folder = (virtual_name, self.sections["transfers"]["downloaddir"])
+
+            if shared_folder not in shares and virtual_name not in (x[0] for x in shares):
+                shares.append(shared_folder)
+
+        # Load command aliases from legacy file
+        try:
+            if not self.sections["server"]["command_aliases"] and os.path.exists(self.filename + ".alias"):
+                with open(self.filename + ".alias", 'rb') as file_handle:
+                    from pynicotine.utils import RestrictedUnpickler
+                    self.sections["server"]["command_aliases"] = RestrictedUnpickler(
+                        file_handle, encoding='utf-8').load()
+
+        except Exception:
+            return
+
+        self.config_loaded = True
+
+    def parse_config(self, filename):
+        """ Parses the config file """
 
         try:
-            f = open(filename+".alias")
-            self.aliases = cPickle.load(f)
-            f.close()
-        except:
-            self.aliases = {}
+            with open(filename, 'a+', encoding="utf-8") as file_handle:
+                file_handle.seek(0)
+                self.parser.read_file(file_handle)
 
-        self.config_lock.release()
+        except UnicodeDecodeError:
+            self.convert_config()
+            self.parse_config(filename)
 
-    def needConfig(self):
-
-        errorlevel = 0
+    def convert_config(self):
+        """ Converts the config to utf-8.
+        Mainly for upgrading Windows build. (22 July, 2020) """
 
         try:
-            for i in self.sections.keys():
-                for j in self.sections[i].keys():
+            from chardet import detect
 
-                    if type(self.sections[i][j]) not in [type(None), type("")]:
-                        continue
+        except ImportError:
+            from pynicotine.logfacility import log
 
-                    if self.sections[i][j] is None or self.sections[i][j] == '' \
-                       and i not in ("userinfo", "ui", "ticker", "players") \
-                       and j not in ("incompletedir", "autoreply", 'afterfinish', 'afterfolder', 'geoblockcc', 'downloadregexp'):
+            log.add("Failed to convert config file to UTF-8. Please install python3-chardet and start "
+                    "the application again.")
+            sys.exit()
 
-                        # Repair options set to None with defaults
-                        if self.sections[i][j] is None and self.defaults[i][j] is not None:
+        os.rename(self.filename, self.filename + ".conv")
 
-                            self.sections[i][j] = self.defaults[i][j]
-                            self.frame.logMessage(
-                                _("Config option reset to default: Section: %(section)s, Option: %(option)s, to: %(default)s") % {
-                                    'section': i,
-                                    'option': j,
-                                    'default': self.sections[i][j]
-                                }
-                            )
+        with open(self.filename + ".conv", 'rb') as file_handle:
+            rawdata = file_handle.read()
 
-                            if errorlevel == 0:
-                                errorlevel = 1
-                        else:
+        from_encoding = detect(rawdata)['encoding']
 
-                            if errorlevel < 2:
-                                self.frame.logMessage(
-                                    _("You need to configure your settings (Server, Username, Password, Download Directory) before connecting...")
-                                )
-                                errorlevel = 2
+        with open(self.filename + ".conv", encoding=from_encoding) as file_read:
+            with open(self.filename, 'w', encoding="utf-8") as file_write:
+                for line in file_read:
+                    file_write.write(line[:-1] + '\r\n')
 
-                            self.frame.logMessage(_("Config option unset: Section: %(section)s, Option: %(option)s") % {'section': i, 'option': j})
-                            self.frame.settingswindow.InvalidSettings(i, j)
+        os.remove(self.filename + ".conv")
 
-        except Exception, error:
-            message = _("Config error: %s") % error
-            self.frame.logMessage(message)
-            if errorlevel < 3:
-                errorlevel = 3
+    def need_config(self):
 
-        if errorlevel > 1:
-            self.frame.settingswindow.SetSettings(self.sections)
+        # Check if we have specified a username or password
+        if not self.sections["server"]["login"] or not self.sections["server"]["passw"]:
+            return True
 
-        return errorlevel
+        return False
 
-    def readConfig(self):
+    def set_config(self):
+        """ Set config values parsed from file earlier """
 
-        self.config_lock.acquire()
-
-        self.sections['transfers']['downloads'] = []
-
-        if exists(self.filename+'.transfers.pickle'):
-            # <1.2.13 stored transfers inside the main config
-            try:
-                handle = open(self.filename+'.transfers.pickle')
-            except IOError, inst:
-                log.addwarning(_("Something went wrong while opening your transfer list: %(error)s") % {'error': str(inst)})
-            else:
-                try:
-                    self.sections['transfers']['downloads'] = cPickle.load(handle)
-                except (IOError, EOFError, ValueError), inst:
-                    log.addwarning(_("Something went wrong while reading your transfer list: %(error)s") % {'error': str(inst)})
-            try:
-                handle.close()
-            except:
-                pass
-
-        path, fn = os.path.split(self.filename)
-        try:
-            if not os.path.isdir(path):
-                os.makedirs(path)
-        except OSError, msg:
-            log.addwarning("Can't create directory '%s', reported error: %s" % (path, msg))
-
-        # Transition from 1.2.16 -> 1.4.0
-        # Do the cleanup early so we don't get the annoying
-        # 'Unknown config option ...' message
-        self.removeOldOption("transfers", "pmqueueddir")
-        self.removeOldOption("server", "lastportstatuscheck")
-        self.removeOldOption("server", "serverlist")
-        self.removeOldOption("userinfo", "descrutf8")
-        self.removeOldOption("ui", "enabletrans")
-        self.removeOldOption("ui", "mozembed")
-        self.removeOldOption("ui", "open_in_mozembed")
-        self.removeOldOption("ui", "tooltips")
-        self.removeOldOption("ui", "transalpha")
-        self.removeOldOption("ui", "transfilter")
-        self.removeOldOption("ui", "transtint")
-        self.removeOldOption("language", "language")
-        self.removeOldOption("language", "setlanguage")
-        self.removeOldSection("language")
-
-        # Transition from 1.4.1 -> 1.4.2
-        self.removeOldOption("columns", "downloads")
-        self.removeOldOption("columns", "uploads")
-
-        # Checking for unknown section/options
-        unknown1 = [
-            'login', 'passw', 'enc', 'downloaddir', 'uploaddir', 'customban',
-            'descr', 'pic', 'logsdir', 'roomlogsdir', 'privatelogsdir',
-            'incompletedir', 'autoreply', 'afterfinish', 'downloadregexp',
-            'afterfolder', 'default', 'chatfont', 'npothercommand', 'npplayer',
-            'npformat', 'private_timestamp', 'rooms_timestamp', 'log_timestamp'
-        ]
-
-        unknown2 = {
-            'ui': [
-                "roomlistcollapsed", "tabclosers", "tab_colors",
-                "tab_reorderable", "buddylistinchatrooms", "trayicon",
-                "showaway", "usernamehotspots", "exitdialog",
-                "tab_icons", "spellcheck", "modes_order", "modes_visible",
-                "chat_hidebuttons", "tab_status_icons", "notexists",
-                "soundenabled", "speechenabled", "enablefilters", "width",
-                "height", "xposition", "yposition", "labelmain", "labelrooms",
-                "labelprivate", "labelinfo", "labelbrowse", "labelsearch"
-            ],
-            'words': [
-                "completion", "censorwords", "replacewords", "autoreplaced",
-                "censored", "characters", "tab", "cycle", "dropdown",
-                "roomnames", "buddies", "roomusers", "commands",
-                "aliases", "onematch"
-            ]
-        }
+        from pynicotine.logfacility import log
 
         for i in self.parser.sections():
-            for j in self.parser.options(i):
-                val = self.parser.get(i, j, raw=1)
-                if i not in self.sections:
-                    log.addwarning(_("Unknown config section '%s'") % i)
-                elif j not in self.sections[i] and not (j == "filter" or i in ('plugins',)):
-                    log.addwarning(_("Unknown config option '%(option)s' in section '%(section)s'") % {'option': j, 'section': i})
-                elif j in unknown1 or (i in unknown2 and j not in unknown2[i]):
-                    if val is not None and val != "None":
-                        self.sections[i][j] = val
-                    else:
-                        self.sections[i][j] = None
+            for j, val in self.parser.items(i, raw=True):
+
+                # Check if config section exists in defaults
+                if i not in self.defaults and i not in self.removed_options:
+                    log.add(_("Unknown config section '%s'"), i)
+
+                # Check if config option exists in defaults
+                elif (j not in self.defaults.get(i, "") and j not in self.removed_options.get(i, "")
+                        and i != "plugins" and j != "filter"):
+                    log.add(_("Unknown config option '%(option)s' in section '%(section)s'"),
+                            {'option': j, 'section': i})
+
                 else:
+                    """ Attempt to get the default value for a config option. If there's no default
+                    value, it's a custom option from a plugin, so no checks are needed. """
+
                     try:
-                        self.sections[i][j] = eval(val, {})
-                    except:
-                        self.sections[i][j] = None
-                        log.addwarning("CONFIG ERROR: Couldn't decode '%s' section '%s' value '%s'" % (str(j), str(i), str(val)))
+                        default_val = self.defaults[i][j]
 
-        # Convert fs-based shared to virtual shared (pre 1.4.0)
-        def _convert_to_virtual(x):
-            if isinstance(x, tuple):
-                return x
-            virtual = x.replace('/', '_').replace('\\', '_').strip('_')
-            log.addwarning("Renaming shared folder '%s' to '%s'. A rescan of your share is required." % (x, virtual))
-            return (virtual, x)
+                    except KeyError:
+                        try:
+                            val = literal_eval(val)
+                        except Exception:
+                            pass
 
-        self.sections["transfers"]["shared"] = [_convert_to_virtual(x) for x in self.sections["transfers"]["shared"]]
-        self.sections["transfers"]["buddyshared"] = [_convert_to_virtual(x) for x in self.sections["transfers"]["buddyshared"]]
+                        self.sections[i][j] = val
+                        continue
 
-        sharedfiles = None
-        bsharedfiles = None
-        sharedfilesstreams = None
-        bsharedfilesstreams = None
-        wordindex = None
-        bwordindex = None
-        fileindex = None
-        bfileindex = None
-        sharedmtimes = None
-        bsharedmtimes = None
+                    """ Check that the value of a config option is of the same type as the default
+                    value. If that's not the case, reset the value. """
 
-        shelves = [
-            self.filename + ".files.db",
-            self.filename + ".buddyfiles.db",
-            self.filename + ".streams.db",
-            self.filename + ".buddystreams.db",
-            self.filename + ".wordindex.db",
-            self.filename + ".buddywordindex.db",
-            self.filename + ".fileindex.db",
-            self.filename + ".buddyfileindex.db",
-            self.filename + ".mtimes.db",
-            self.filename + ".buddymtimes.db"
-        ]
+                    try:
+                        if not isinstance(default_val, str):
+                            # Values are always read as strings, evaluate them if they aren't
+                            # supposed to remain as strings
+                            eval_val = literal_eval(val)
 
-        _opened_shelves = []
-        _errors = []
-        for shelvefile in shelves:
-            try:
-                _opened_shelves.append(shelve.open(shelvefile))
-            except:
-                _errors.append(shelvefile)
-                try:
-                    os.unlink(shelvefile)
-                    _opened_shelves.append(shelve.open(shelvefile, flag='n'))
-                except Exception, ex:
-                    print("Failed to unlink %s: %s" % (shelvefile, ex))
+                        else:
+                            eval_val = val
 
-        sharedfiles = _opened_shelves.pop(0)
-        bsharedfiles = _opened_shelves.pop(0)
-        sharedfilesstreams = _opened_shelves.pop(0)
-        bsharedfilesstreams = _opened_shelves.pop(0)
-        wordindex = _opened_shelves.pop(0)
-        bwordindex = _opened_shelves.pop(0)
-        fileindex = _opened_shelves.pop(0)
-        bfileindex = _opened_shelves.pop(0)
-        sharedmtimes = _opened_shelves.pop(0)
-        bsharedmtimes = _opened_shelves.pop(0)
+                        if i != "plugins" and j != "filter":
+                            if (isinstance(eval_val, type(default_val))
+                                    or (isinstance(default_val, bool)
+                                        and isinstance(eval_val, int) and eval_val in (0, 1))):
+                                # Value is valid
+                                pass
 
-        if _errors:
-            log.addwarning(_("Failed to process the following databases: %(names)s") % {'names': '\n'.join(_errors)})
+                            else:
+                                raise TypeError("Invalid config value type detected")
 
-            files = self.clearShares(
-                sharedfiles, bsharedfiles, sharedfilesstreams, bsharedfilesstreams,
-                wordindex, bwordindex, fileindex, bfileindex, sharedmtimes, bsharedmtimes
-            )
+                        self.sections[i][j] = eval_val
 
-            if files is not None:
-                sharedfiles, bsharedfiles, sharedfilesstreams, bsharedfilesstreams, wordindex, bwordindex, fileindex, bfileindex, sharedmtimes, bsharedmtimes = files
+                    except Exception:
+                        # Value was unexpected, reset option
+                        self.sections[i][j] = default_val
 
-            log.addwarning(_("Shared files database seems to be corrupted, rescan your shares"))
+                        log.add("Config error: Couldn't decode '%s' section '%s' value '%s', value has been reset", (
+                            (i[:120] + '…') if len(i) > 120 else i,
+                            (j[:120] + '…') if len(j) > 120 else j,
+                            (val[:120] + '…') if len(val) > 120 else val
+                        ))
 
-        self.sections["transfers"]["sharedfiles"] = sharedfiles
-        self.sections["transfers"]["sharedfilesstreams"] = sharedfilesstreams
-        self.sections["transfers"]["wordindex"] = wordindex
-        self.sections["transfers"]["fileindex"] = fileindex
-        self.sections["transfers"]["sharedmtimes"] = sharedmtimes
+        server = self.sections["server"]
 
-        self.sections["transfers"]["bsharedfiles"] = bsharedfiles
-        self.sections["transfers"]["bsharedfilesstreams"] = bsharedfilesstreams
-        self.sections["transfers"]["bwordindex"] = bwordindex
-        self.sections["transfers"]["bfileindex"] = bfileindex
-        self.sections["transfers"]["bsharedmtimes"] = bsharedmtimes
+        # Check if server value is valid
+        if (len(server["server"]) != 2
+                or not isinstance(server["server"][0], str)
+                or not isinstance(server["server"][1], int)):
 
-        # Setting the port range in numerical order
-        self.sections["server"]["portrange"] = (min(self.sections["server"]["portrange"]), max(self.sections["server"]["portrange"]))
+            server["server"] = self.defaults["server"]["server"]
 
-        self.config_lock.release()
+        # Check if port range value is valid
+        if (len(server["portrange"]) != 2
+                or not all(isinstance(i, int) for i in server["portrange"])):
 
-    def removeOldOption(self, section, option):
-        if section in self.parser.sections():
-            if option in self.parser.options(section):
+            server["portrange"] = self.defaults["server"]["portrange"]
+
+        else:
+            # Setting the port range in numerical order
+            server["portrange"] = (min(server["portrange"]), max(server["portrange"]))
+
+    def write_config_callback(self, filename):
+        self.parser.write(filename)
+
+    def write_configuration(self):
+
+        if not self.config_loaded:
+            return
+
+        # Write new config options to file
+        for section, options in self.sections.items():
+            if not self.parser.has_section(section):
+                self.parser.add_section(section)
+
+            for option, value in options.items():
+                self.parser.set(section, option, str(value))
+
+        # Remove legacy config options
+        for section, options in self.removed_options.items():
+            if not self.parser.has_section(section):
+                continue
+
+            for option in options:
                 self.parser.remove_option(section, option)
 
-    def removeOldSection(self, section):
-        if section in self.parser.sections():
-            self.parser.remove_section(section)
-
-    def clearShares(
-        self, sharedfiles, bsharedfiles, sharedfilesstreams, bsharedfilesstreams,
-        wordindex, bwordindex, fileindex, bfileindex, sharedmtimes, bsharedmtimes
-    ):
-
-        try:
-            if sharedfiles:
-                sharedfiles.close()
-            try:
-                os.unlink(self.filename + '.files.db')
-            except:
-                pass
-            sharedfiles = shelve.open(self.filename + ".files.db", flag='n')
-
-            if bsharedfiles:
-                bsharedfiles.close()
-            try:
-                os.unlink(self.filename + '.buddyfiles.db')
-            except:
-                pass
-            bsharedfiles = shelve.open(self.filename + ".buddyfiles.db", flag='n')
-
-            if sharedfilesstreams:
-                sharedfilesstreams.close()
-            try:
-                os.unlink(self.filename + '.streams.db')
-            except:
-                pass
-            sharedfilesstreams = shelve.open(self.filename + ".streams.db", flag='n')
-
-            if bsharedfilesstreams:
-                bsharedfilesstreams.close()
-            try:
-                os.unlink(self.filename + '.buddystreams.db')
-            except:
-                pass
-            bsharedfilesstreams = shelve.open(self.filename + ".buddystreams.db", flag='n')
-
-            if wordindex:
-                wordindex.close()
-            try:
-                os.unlink(self.filename + '.wordindex.db')
-            except:
-                pass
-            wordindex = shelve.open(self.filename + ".wordindex.db", flag='n')
-
-            if bwordindex:
-                bwordindex.close()
-            try:
-                os.unlink(self.filename + '.buddywordindex.db')
-            except:
-                pass
-            bwordindex = shelve.open(self.filename + ".buddywordindex.db", flag='n')
-
-            if fileindex:
-                fileindex.close()
-            try:
-                os.unlink(self.filename + '.fileindex.db')
-            except:
-                pass
-            fileindex = shelve.open(self.filename + ".fileindex.db", flag='n')
-
-            if bfileindex:
-                bfileindex.close()
-            try:
-                os.unlink(self.filename + '.buddyfileindex.db')
-            except:
-                pass
-            bfileindex = shelve.open(self.filename + ".buddyfileindex.db", flag='n')
-
-            if sharedmtimes:
-                sharedmtimes.close()
-            try:
-                os.unlink(self.filename + '.mtimes.db')
-            except:
-                pass
-            sharedmtimes = shelve.open(self.filename + ".mtimes.db", flag='n')
-
-            if bsharedmtimes:
-                bsharedmtimes.close()
-            try:
-                os.unlink(self.filename + '.buddymtimes.db')
-            except:
-                pass
-            bsharedmtimes = shelve.open(self.filename + ".buddymtimes.db", flag='n')
-        except Exception, error:
-            log.addwarning(_("Error while writing database files: %s") % error)
-            return None
-        return sharedfiles, bsharedfiles, sharedfilesstreams, bsharedfilesstreams, wordindex, bwordindex, fileindex, bfileindex, sharedmtimes, bsharedmtimes
-
-    def writeConfig(self):
-        self.writeConfiguration()
-        self.writeDownloadQueue()
-
-    def writeDownloadQueue(self):
-        self.config_lock.acquire()
-        realfile = self.filename + '.transfers.pickle'
-        tmpfile = realfile + '.tmp'
-        backupfile = realfile + ' .backup'
-        try:
-            handle = open(tmpfile, 'w')
-        except Exception, inst:
-            log.addwarning(_("Something went wrong while opening your transfer list: %(error)s") % {'error': str(inst)})
-        else:
-            try:
-                cPickle.dump(self.sections['transfers']['downloads'], handle)
-                handle.close()
-                try:
-                    # Please let it be atomic...
-                    os.rename(tmpfile, realfile)
-                except Exception, inst:
-                    # ...ugh. Okay, how about...
-                    try:
-                        os.unlink(backupfile)
-                    except:
-                        pass
-                    os.rename(realfile, backupfile)
-                    os.rename(tmpfile, realfile)
-            except Exception, inst:
-                log.addwarning(_("Something went wrong while writing your transfer list: %(error)s") % {'error': str(inst)})
-        finally:
-            try:
-                handle.close()
-            except:
-                pass
-        self.config_lock.release()
-
-    def writeConfiguration(self):
-
-        self.config_lock.acquire()
-
-        external_sections = [
-            "sharedfiles", "sharedfilesstreams", "wordindex", "fileindex",
-            "sharedmtimes", "bsharedfiles", "bsharedfilesstreams",
-            "bwordindex", "bfileindex", "bsharedmtimes", "downloads"
-        ]
-
-        for i in self.sections.keys():
-            if not self.parser.has_section(i):
-                self.parser.add_section(i)
-            for j in self.sections[i].keys():
-                if j not in external_sections:
-                    self.parser.set(i, j, self.sections[i][j])
-                else:
-                    self.parser.remove_option(i, j)
-
-        path, fn = os.path.split(self.filename)
-        try:
-            if not os.path.isdir(path):
-                os.makedirs(path)
-        except OSError, msg:
-            log.addwarning(_("Can't create directory '%(path)s', reported error: %(error)s") % {'path': path, 'error': msg})
-
-        oldumask = os.umask(0077)
-
-        try:
-            f = open(self.filename + ".new", "w")
-        except IOError, e:
-            log.addwarning(_("Can't save config file, I/O error: %s") % e)
-            self.config_lock.release()
+        if not self.create_config_folder():
             return
-        else:
-            try:
-                self.parser.write(f)
-            except IOError, e:
-                log.addwarning(_("Can't save config file, I/O error: %s") % e)
-                self.config_lock.release()
-                return
-            else:
-                f.close()
 
-        os.umask(oldumask)
+        from pynicotine.utils import write_file_and_backup
+        write_file_and_backup(self.filename, self.write_config_callback, protect=True)
 
-        # A paranoid precaution since config contains the password
-        try:
-            os.chmod(self.filename, 0600)
-        except:
-            pass
+    def write_config_backup(self, filename):
 
-        try:
-            s = os.stat(self.filename)
-            if s.st_size > 0:
-                try:
-                    if os.path.exists(self.filename + ".old"):
-                        os.remove(self.filename + ".old")
-                except OSError, error:
-                    log.addwarning(_("Can't remove %s" % self.filename + ".old"))
-                try:
-                    os.rename(self.filename, self.filename + ".old")
-                except OSError, error:
-                    log.addwarning(_("Can't back config file up, error: %s") % error)
-        except OSError:
-            pass
+        from pynicotine.logfacility import log
 
-        try:
-            os.rename(self.filename + ".new", self.filename)
-        except OSError, error:
-            log.addwarning(_("Can't rename config file, error: %s") % error)
+        if not filename.endswith(".tar.bz2"):
+            filename += ".tar.bz2"
 
-        self.config_lock.release()
-
-    def writeConfigBackup(self, filename=None):
-
-        self.config_lock.acquire()
-
-        if filename is None:
-            filename = "%s backup %s.tar.bz2" % (self.filename, time.strftime("%Y-%m-%d %H:%M:%S"))
-        else:
-            if filename[-8:-1] != ".tar.bz2":
-                filename += ".tar.bz2"
         try:
             if os.path.exists(filename):
-                raise BaseException("File %s exists" % filename)
+                raise FileExistsError("File %s exists" % filename)
+
             import tarfile
-            tar = tarfile.open(filename, "w:bz2")
-            if not os.path.exists(self.filename):
-                raise BaseException("Config file missing")
-            tar.add(self.filename)
-            if os.path.exists(self.filename+".alias"):
-                tar.add(self.filename+".alias")
+            with tarfile.open(filename, "w:bz2") as tar:
+                if not os.path.exists(self.filename):
+                    raise FileNotFoundError("Config file missing")
 
-            tar.close()
-        except Exception, e:
-            print e
-            self.config_lock.release()
-            return (1, "Cannot write backup archive: %s" % e)
-        self.config_lock.release()
-        return (0, filename)
+                tar.add(self.filename)
 
-    def setBuddyShares(self, files, streams, wordindex, fileindex, mtimes):
+        except Exception as error:
+            log.add(_("Error backing up config: %s"), error)
+            return
 
-        storable_objects = [
-                (files,     "bsharedfiles",        ".buddyfiles.db"),
-                (streams,   "bsharedfilesstreams", ".buddystreams.db"),
-                (mtimes,    "bsharedmtimes",       ".buddymtimes.db"),
-                (wordindex, "bwordindex",          ".buddywordindex.db"),
-                (fileindex, "bfileindex",          ".buddyfileindex.db")
-        ]
+        log.add(_("Config backed up to: %s"), filename)
 
-        self.config_lock.acquire()
-        self._storeObjects(storable_objects)
-        self.config_lock.release()
 
-    def setShares(self, files, streams, wordindex, fileindex, mtimes):
-
-        storable_objects = [
-                (files,     "sharedfiles",        ".files.db"),
-                (streams,   "sharedfilesstreams", ".streams.db"),
-                (mtimes,    "sharedmtimes",       ".mtimes.db"),
-                (wordindex, "wordindex",          ".wordindex.db"),
-                (fileindex, "fileindex",          ".fileindex.db")
-        ]
-
-        self.config_lock.acquire()
-        self._storeObjects(storable_objects)
-        self.config_lock.release()
-
-    def _storeObjects(self, storable_objects):
-
-        for (source, destination, prefix) in storable_objects:
-
-            self.sections["transfers"][destination].close()
-            self.sections["transfers"][destination] = shelve.open(self.filename + prefix, flag='n')
-
-            for (key, value) in source.iteritems():
-                self.sections["transfers"][destination][key] = value
-
-    def writeShares(self):
-
-        self.config_lock.acquire()
-
-        self.sections["transfers"]["sharedfiles"].sync()
-        self.sections["transfers"]["sharedfilesstreams"].sync()
-        self.sections["transfers"]["wordindex"].sync()
-        self.sections["transfers"]["fileindex"].sync()
-        self.sections["transfers"]["sharedmtimes"].sync()
-
-        self.sections["transfers"]["bsharedfiles"].sync()
-        self.sections["transfers"]["bsharedfilesstreams"].sync()
-        self.sections["transfers"]["bwordindex"].sync()
-        self.sections["transfers"]["bfileindex"].sync()
-        self.sections["transfers"]["bsharedmtimes"].sync()
-
-        self.config_lock.release()
-
-    def pushHistory(self, history, text, max):
-        if text in history:
-            history.remove(text)
-        elif len(history) >= max:
-            del history[-1]
-        history.insert(0, text)
-        self.writeConfig()
-
-    def writeAliases(self):
-        self.config_lock.acquire()
-        f = open(self.filename+".alias", "w")
-        cPickle.dump(self.aliases, f, 1)
-        f.close()
-        self.config_lock.release()
-
-    def AddAlias(self, rest):
-        if rest:
-            args = rest.split(" ", 1)
-            if len(args) == 2:
-                if args[0] in ("alias", "unalias"):
-                    return "I will not alias that!\n"
-                self.aliases[args[0]] = args[1]
-                self.writeAliases()
-            if args[0] in self.aliases:
-                return "Alias %s: %s\n" % (args[0], self.aliases[args[0]])
-            else:
-                return _("No such alias (%s)") % rest + "\n"
-        else:
-            m = "\n" + _("Aliases:") + "\n"
-            for (key, value) in self.aliases.iteritems():
-                m = m + "%s: %s\n" % (key, value)
-            return m+"\n"
-
-    def Unalias(self, rest):
-        if rest and rest in self.aliases:
-            x = self.aliases[rest]
-            del self.aliases[rest]
-            self.writeAliases()
-            return _("Removed alias %(alias)s: %(action)s\n") % {'alias': rest, 'action': x}
-        else:
-            return _("No such alias (%(alias)s)\n") % {'alias': rest}
+config = Config()
